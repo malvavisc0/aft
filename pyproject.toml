@@ -1,0 +1,55 @@
+[project]
+name = "aft"
+dynamic = ["version"]
+description = "Standalone fine-tuning and GPTQ quantization pipeline for instruction-following models."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    { name = "Malvavisc0" },
+]
+dependencies = [
+    "torch",
+    "torchvision",
+    "transformers",
+    "peft",
+    "trl",
+    "bitsandbytes",
+    "accelerate",
+    "datasets",
+    "gptqmodel @ git+https://github.com/ModelCloud/GPTQModel.git",
+    "huggingface-hub",
+    "logbar",
+    "tokenicer",
+    "defuser",
+    "device-smi",
+    "typer",
+    "rich",
+    "loguru",
+]
+
+[project.scripts]
+aft = "aft:main"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "aft.__version__"}
+
+[tool.uv]
+no-build-isolation-package = ["gptqmodel"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aft"]
