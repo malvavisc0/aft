@@ -5,10 +5,11 @@ from pathlib import Path
 
 import typer
 from rich import box
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from typing_extensions import Annotated
+
+from aft.ui import console
 
 app = typer.Typer(
     name="aft",
@@ -19,18 +20,12 @@ app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
-console = Console(width=120)
 
 
 def _banner() -> None:
     from aft import __version__
 
-    logo = (
-        "[bold cyan]"
-        "  ╔═╗╔═╗╔╦╗\n"
-        "  ╠═╣╠╣  ║ \n"
-        "  ╩ ╩╚   ╩ [/bold cyan]"
-    )
+    logo = "[bold cyan]  ╔═╗╔═╗╔╦╗\n  ╠═╣╠╣  ║ \n  ╩ ╩╚   ╩ [/bold cyan]"
     console.print(logo)
     console.print(
         f"  [dim]v{__version__}[/dim] [dim]│[/dim]"
@@ -65,38 +60,23 @@ def recommend_cmd(
     ] = None,
 ) -> None:
     """Suggest QLoRA fine-tuning parameters for your hardware and model."""
-    import logging
-
     import torch
 
     _banner()
 
-    for _name in ("httpcore", "httpx", "huggingface_hub", "urllib3"):
-        logging.getLogger(_name).setLevel(logging.WARNING)
-
-    from aft.recommend import (
-        detect_gpus,
-        detect_system_ram_mib,
-        fetch_model_info,
-        get_total_vram_mib,
-        recommend,
-    )
+    from aft.recommend import detect_system_ram_mib, fetch_model_info, recommend
 
     with console.status("[bold cyan]Detecting hardware...[/bold cyan]", spinner="dots"):
-        import time
-
-        time.sleep(0.3)
-        gpus = detect_gpus()
-        total_vram_mib = get_total_vram_mib()
-        total_ram_mib = detect_system_ram_mib()
-        bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
-
-        if not gpus and torch.cuda.is_available():
+        # Use torch.cuda as the single source of truth for GPU detection
+        gpus: list[dict] = []
+        if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 name = torch.cuda.get_device_name(i)
                 mem = torch.cuda.get_device_properties(i).total_mem // (1024 * 1024)
                 gpus.append({"name": name, "vram_mib": int(mem)})
-            total_vram_mib = sum(g["vram_mib"] for g in gpus)
+        total_vram_mib = sum(g["vram_mib"] for g in gpus)
+        total_ram_mib = detect_system_ram_mib()
+        bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
 
     console.print("  [bold cyan]⚡ Hardware[/bold cyan]")
     if gpus:
@@ -123,13 +103,14 @@ def recommend_cmd(
         console.print()
 
     with console.status(
-        f"[bold cyan]Fetching model info: {model}...[/bold cyan]", spinner="dots"
+        f"[bold cyan]Fetching model info: {model}...[/bold cyan]",
+        spinner="dots",
     ):
         try:
             model_info = fetch_model_info(model, token=token)
         except Exception as exc:
             console.print(f"[red]Failed to fetch model info: {exc}[/red]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from exc
 
     console.print(f"  [bold cyan]🧠 {model}[/bold cyan]")
     arch_str = ", ".join(model_info.architectures) or "unknown"
@@ -154,9 +135,6 @@ def recommend_cmd(
     with console.status(
         "[bold cyan]Computing recommendations...[/bold cyan]", spinner="dots"
     ):
-        import time
-
-        time.sleep(0.2)
         rec = recommend(
             model_info=model_info,
             vram_mib=total_vram_mib or 24 * 1024,
@@ -232,6 +210,7 @@ def run_cmd(
     lora_alpha: Annotated[
         int | None, typer.Option(help="LoRA alpha. Defaults to 2x lora_rank.")
     ] = None,
+    lora_dropout: Annotated[float, typer.Option(help="LoRA dropout rate.")] = 0.05,
     max_seq_len: Annotated[int, typer.Option(help="Max sequence length.")] = 2048,
     epochs: Annotated[int, typer.Option(help="Training epochs.")] = 1,
     batch_size: Annotated[int, typer.Option(help="Per-device batch size.")] = 2,
@@ -259,16 +238,20 @@ def run_cmd(
     calibration: Annotated[
         str, typer.Option(help="'wikitext2' or path to JSONL.")
     ] = "wikitext2",
+    trust_remote_code: Annotated[
+        bool, typer.Option(help="Allow loading models with custom code.")
+    ] = False,
+    resume: Annotated[
+        bool, typer.Option("--resume", help="Skip phases whose output exists.")
+    ] = False,
 ) -> None:
     """Full pipeline: QLoRA SFT → merge LoRA → GPTQ quantize."""
     from aft.config import QuantizeConfig, TrainConfig
-    from aft.pipeline import merge_adapter, quantize, train
+    from aft.pipeline import AftError, merge_adapter, quantize, train
 
     _banner()
 
     steps = ["QLoRA SFT", "Merge LoRA", f"GPTQ Int{gptq_bits}"]
-    current_step = 0
-    _step_bar(current_step, steps)
 
     dataset_ids = [d.strip() for d in dataset.split(",") if d.strip()]
     lang_list = (
@@ -282,65 +265,104 @@ def run_cmd(
     merged_dir = base_dir / "merged"
     gptq_dir = base_dir / f"gptq-int{gptq_bits}"
 
-    if not skip_finetune:
-        cfg = TrainConfig(
-            base_model=model,
-            datasets=dataset_ids,
-            run_name=run_name,
-            output_dir=str(base_dir),
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha if lora_alpha is not None else lora_rank * 2,
-            max_seq_len=max_seq_len,
-            num_epochs=epochs,
-            per_device_batch_size=batch_size,
-            gradient_accumulation_steps=grad_accum,
-            learning_rate=learning_rate,
-            max_samples=max_samples,
-            clean=clean,
-            dedup=dedup,
-            min_tokens=min_tokens,
-            max_tokens=max_tokens,
-            languages=lang_list,
-            max_special_ratio=max_special_ratio,
-        )
-        train(cfg)
-    else:
-        if not adapter_dir.exists():
+    # --resume: auto-detect what can be skipped
+    skip_merge = False
+    if resume:
+        if adapter_dir.exists() and (adapter_dir / "adapter_config.json").exists():
+            skip_finetune = True
             console.print(
-                f"[red]--skip-finetune set but adapter not found: {adapter_dir}[/red]"
+                "[yellow]⚠ Resume: adapter exists → skipping training[/yellow]"
             )
-            raise typer.Exit(1)
-        console.print(
-            f"[yellow]Skipping SFT — using existing adapter: {adapter_dir}[/yellow]"
+        if merged_dir.exists() and any(merged_dir.glob("*.safetensors")):
+            skip_merge = True
+            console.print(
+                "[yellow]⚠ Resume: merged model exists → skipping merge[/yellow]"
+            )
+        if gptq_dir.exists() and any(gptq_dir.glob("*.safetensors")):
+            skip_quantize = True
+            console.print(
+                "[yellow]⚠ Resume: quantized model exists → skipping quantize[/yellow]"
+            )
+
+    try:
+        # ── Phase 1: QLoRA SFT ─────────────────────────────────────────
+        _step_bar(0, steps)
+
+        if not skip_finetune:
+            cfg = TrainConfig(
+                base_model=model,
+                datasets=dataset_ids,
+                run_name=run_name,
+                output_dir=str(base_dir),
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha if lora_alpha is not None else lora_rank * 2,
+                lora_dropout=lora_dropout,
+                max_seq_len=max_seq_len,
+                num_epochs=epochs,
+                per_device_batch_size=batch_size,
+                gradient_accumulation_steps=grad_accum,
+                learning_rate=learning_rate,
+                max_samples=max_samples,
+                clean=clean,
+                dedup=dedup,
+                min_tokens=min_tokens,
+                max_tokens=max_tokens,
+                languages=lang_list,
+                max_special_ratio=max_special_ratio,
+                trust_remote_code=trust_remote_code,
+            )
+            train(cfg)
+        else:
+            if not adapter_dir.exists():
+                console.print(
+                    f"[red]✗ --skip-finetune set but adapter not found: {adapter_dir}[/red]"
+                )
+                raise typer.Exit(1)
+            console.print(
+                f"[yellow]⚠ Skipping SFT — using existing adapter: {adapter_dir}[/yellow]"
+            )
+
+        # ── Phase 2: Merge LoRA ────────────────────────────────────────
+        _step_bar(1, steps)
+
+        if skip_merge:
+            console.print(
+                f"[yellow]⚠ Skipping merge — using existing: {merged_dir}[/yellow]"
+            )
+        else:
+            merge_adapter(
+                model, adapter_dir, merged_dir, trust_remote_code=trust_remote_code
+            )
+
+        if skip_quantize:
+            console.print(
+                f"[yellow]⚠ Skipping quantization. Merged model: {merged_dir}[/yellow]"
+            )
+            return
+
+        # ── Phase 3: GPTQ Quantize ────────────────────────────────────
+        _step_bar(2, steps)
+
+        quantize(
+            merged_dir,
+            gptq_dir,
+            QuantizeConfig(
+                bits=gptq_bits,
+                group_size=gptq_group_size,
+                calibration_dataset=calibration,
+                trust_remote_code=trust_remote_code,
+            ),
         )
 
-    current_step = 1
-    _step_bar(current_step, steps)
-    merge_adapter(model, adapter_dir, merged_dir)
+        _step_bar(len(steps), steps)
 
-    if skip_quantize:
-        console.print(
-            f"[yellow]Skipping quantization. Merged model: {merged_dir}[/yellow]"
-        )
-        return
-
-    current_step = 2
-    _step_bar(current_step, steps)
-    quantize(
-        merged_dir,
-        gptq_dir,
-        QuantizeConfig(
-            bits=gptq_bits,
-            group_size=gptq_group_size,
-            calibration_dataset=calibration,
-        ),
-    )
-
-    _step_bar(len(steps), steps)
+    except AftError as exc:
+        console.print(f"\n[red]✗ {exc}[/red]")
+        raise typer.Exit(1) from exc
 
     summary = Table(
         show_header=False,
-        title="[bold green]✅ Pipeline complete[/bold green]",
+        title="[bold green]✓ Pipeline complete[/bold green]",
         box=box.ROUNDED,
         border_style="green",
         pad_edge=True,
@@ -363,26 +385,42 @@ def quantize_cmd(
     ],
     bits: Annotated[int, typer.Option(help="Quantization bits.")] = 4,
     group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
+    desc_act: Annotated[
+        bool, typer.Option("--desc-act", help="Use activation order (slower, better).")
+    ] = False,
     calibration: Annotated[
         str, typer.Option(help="'wikitext2' or path to JSONL.")
     ] = "wikitext2",
     n_calibration_samples: Annotated[
         int, typer.Option(help="Number of calibration samples.")
     ] = 128,
+    calibration_seq_len: Annotated[
+        int, typer.Option(help="Calibration sequence length.")
+    ] = 2048,
+    trust_remote_code: Annotated[
+        bool, typer.Option(help="Allow loading models with custom code.")
+    ] = False,
 ) -> None:
     """Quantize an already-merged model to GPTQ Int4."""
     from aft.config import QuantizeConfig
-    from aft.pipeline import quantize
+    from aft.pipeline import AftError, quantize
 
     _banner()
 
     cfg = QuantizeConfig(
         bits=bits,
         group_size=group_size,
+        desc_act=desc_act,
         calibration_dataset=calibration,
         n_calibration_samples=n_calibration_samples,
+        calibration_seq_len=calibration_seq_len,
+        trust_remote_code=trust_remote_code,
     )
-    quantize(merged_model, output, cfg)
+    try:
+        quantize(merged_model, output, cfg)
+    except AftError as exc:
+        console.print(f"\n[red]✗ {exc}[/red]")
+        raise typer.Exit(1) from exc
     console.print(
         Panel(
             f"[dim]vllm serve {output} --quantization gptq_marlin[/dim]",

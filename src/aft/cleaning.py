@@ -1,11 +1,11 @@
 """Dataset cleaning utilities for fine-tuning."""
 
+import hashlib
 import re
 
 from loguru import logger
-from rich.console import Console
 
-console = Console(width=200)
+from aft.ui import console
 
 
 def clean_dataset(
@@ -106,10 +106,10 @@ def clean_dataset(
 
     # ── 5. Deduplication ──────────────────────────────────────────────
     if dedup:
-        seen: set[int] = set()
+        seen: set[str] = set()
 
         def _not_dup(example: dict) -> bool:
-            h = hash(example["text"])
+            h = hashlib.sha256(example["text"].encode()).hexdigest()
             if h in seen:
                 return False
             seen.add(h)

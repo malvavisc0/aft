@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # Skip installing GPU-only packages (gptqmodel, bitsandbytes, etc.)
+  # that require CUDA build tools not available on CI runners.
+  UV_NO_BUILD_ISOLATION: 0
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --group dev --no-install-package gptqmodel --no-install-package bitsandbytes
+      - name: Ruff check
+        run: uv run ruff check src/ tests/
+      - name: Ruff format check
+        run: uv run ruff format --check src/ tests/
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --group dev --no-install-package gptqmodel --no-install-package bitsandbytes
+      - name: Run tests with coverage
+        run: uv run pytest --cov=aft --cov-report=term-missing --cov-report=xml

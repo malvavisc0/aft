@@ -1,40 +1,8 @@
 """Hardware detection and QLoRA parameter recommendation."""
 
-import json
 import re
-import subprocess
 
 from aft.config import ModelInfo, Recommendation
-
-
-def detect_gpus() -> list[dict]:
-    """Detect NVIDIA GPUs via nvidia-smi. Returns list of {name, vram_mib}."""
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            return []
-        gpus = []
-        for line in result.stdout.strip().splitlines():
-            parts = line.split(", ")
-            if len(parts) == 2:
-                gpus.append({"name": parts[0], "vram_mib": int(parts[1])})
-        return gpus
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-
-
-def get_total_vram_mib() -> int:
-    """Get total VRAM across all GPUs in MiB."""
-    return sum(g["vram_mib"] for g in detect_gpus())
 
 
 def detect_system_ram_mib() -> int:
@@ -55,7 +23,7 @@ def fetch_model_info(repo_id: str, token: str | None = None) -> ModelInfo:
 
     Uses the HF API to retrieve parameter count and architecture info.
     """
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi
 
     api = HfApi(token=token)
     info = api.model_info(repo_id)
@@ -70,34 +38,7 @@ def fetch_model_info(repo_id: str, token: str | None = None) -> ModelInfo:
     num_layers = info.config.get("num_hidden_layers") if info.config else None
 
     if params_b == 0.0:
-        try:
-            config_path = hf_hub_download(repo_id, "config.json", token=token)
-            with open(config_path) as f:
-                cfg = json.load(f)
-            model_type = cfg.get("model_type", model_type)
-            hidden_size = cfg.get("hidden_size", hidden_size)
-            num_layers = cfg.get("num_hidden_layers", num_layers)
-            architectures = cfg.get("architectures", architectures)
-            # Estimate params from architecture dimensions
-            if hidden_size and num_layers:
-                vocab_size = cfg.get("vocab_size", 32000)
-                intermediate = cfg.get("intermediate_size", hidden_size * 4)
-                # embed + per-layer (attn + mlp + norms) + final head
-                params_b = (
-                    vocab_size * hidden_size  # embeddings
-                    + num_layers
-                    * (
-                        4 * hidden_size * hidden_size  # attention QKV+O
-                        + 3 * hidden_size * intermediate  # MLP gate/up/down
-                        + 2 * hidden_size  # layer norms
-                    )
-                    + vocab_size * hidden_size  # lm_head
-                ) / 1e9
-        except Exception:
-            pass
-
-    # Last resort: parse size from repo name (e.g. "9B", "7b", "70B")
-    if params_b == 0.0:
+        # Fallback: parse size from repo name (e.g. "9B", "7b", "70B")
         match = re.search(r"(\d+(?:\.\d+)?)[Bb]", repo_id)
         if match:
             params_b = float(match.group(1))
@@ -183,7 +124,7 @@ def recommend(
             "cpu": f"{int(ram_gib * 0.8)}GiB",
         }
         reasoning.append(
-            f"⚠ VRAM very tight ({remaining_gib:.1f} GiB after weights) → "
+            f"VRAM very tight ({remaining_gib:.1f} GiB after weights) - "
             f"seq_len={max_seq_len}, batch=1, CPU offload enabled"
         )
     elif remaining_gib < 4.0:

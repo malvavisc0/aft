@@ -33,6 +33,7 @@ class TrainConfig:
     max_tokens: int | None = None
     languages: list[str] | None = None
     max_special_ratio: float = 0.3
+    trust_remote_code: bool = False
 
 
 @dataclass
@@ -45,6 +46,7 @@ class QuantizeConfig:
     calibration_dataset: str = "wikitext2"
     n_calibration_samples: int = 128
     calibration_seq_len: int = 2048
+    trust_remote_code: bool = False
 
 
 @dataclass

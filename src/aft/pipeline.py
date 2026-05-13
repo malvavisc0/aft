@@ -1,40 +1,27 @@
 """Core pipeline: QLoRA SFT → Merge → GPTQ Quantize → Push to Hub."""
 
 import json
-import logging
 import os
 import tempfile
 from pathlib import Path
 
 import torch
 from loguru import logger
-from rich.console import Console
 
 from aft.config import QuantizeConfig, TrainConfig
+from aft.ui import console, silence_noisy_loggers
 
-console = Console(width=200)
+
+class AftError(RuntimeError):
+    """User-facing pipeline error (caught by CLI for clean output)."""
 
 
 def _hf_token() -> str | None:
-    """Resolve HuggingFace token from environment."""
+    """Resolve HuggingFace token from environment.
+
+    Returns ``None`` when the variable is absent *or* set to an empty string.
+    """
     return os.getenv("HF_TOKEN") or None
-
-
-def _silence_debug_loggers() -> None:
-    """Suppress noisy DEBUG logs from HF/HTTP libraries."""
-    for name in (
-        "httpcore",
-        "httpx",
-        "datasets",
-        "torchao",
-        "filelock",
-        "fsspec",
-        "huggingface_hub",
-        "bitsandbytes",
-        "urllib3",
-        "gptqmodel",
-    ):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # ── Phase 1: QLoRA SFT ────────────────────────────────────────────────────
@@ -57,7 +44,7 @@ def train(config: TrainConfig) -> Path:
 
     from aft.cleaning import clean_dataset
 
-    _silence_debug_loggers()
+    silence_noisy_loggers()
 
     hf_token = _hf_token()
     out = (
@@ -70,7 +57,9 @@ def train(config: TrainConfig) -> Path:
 
     console.print(f"[cyan]Loading tokenizer: {config.base_model}[/cyan]")
     tokenizer = AutoTokenizer.from_pretrained(
-        config.base_model, trust_remote_code=True, token=hf_token
+        config.base_model,
+        trust_remote_code=config.trust_remote_code,
+        token=hf_token,
     )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -85,7 +74,7 @@ def train(config: TrainConfig) -> Path:
     model_kwargs: dict = dict(
         quantization_config=bnb,
         device_map="auto",
-        trust_remote_code=True,
+        trust_remote_code=config.trust_remote_code,
         attn_implementation="sdpa",
         token=hf_token,
     )
@@ -184,8 +173,20 @@ def train(config: TrainConfig) -> Path:
         args=args,
     )
 
-    console.print("[green]Training started...[/green]")
-    trainer.train()
+    console.print("[cyan]Training started...[/cyan]")
+    try:
+        trainer.train()
+    except Exception as e:
+        logger.error(
+            "Training failed at adapter dir {}: {}",
+            adapter_dir,
+            e,
+        )
+        raise AftError(
+            f"QLoRA training failed. Check logs above for details.\n"
+            f"  Adapter dir: {adapter_dir}\n"
+            f"  To resume, fix the issue and re-run with --resume."
+        ) from e
     trainer.save_model(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
     logger.info("Adapter saved to {}", adapter_dir)
@@ -196,7 +197,13 @@ def train(config: TrainConfig) -> Path:
 # ── Phase 2: Merge LoRA ───────────────────────────────────────────────────
 
 
-def merge_adapter(base_model: str, adapter_path: Path, output: Path) -> Path:
+def merge_adapter(
+    base_model: str,
+    adapter_path: Path,
+    output: Path,
+    *,
+    trust_remote_code: bool = False,
+) -> Path:
     """Merge LoRA adapter into the base model as fp16 safetensors.
 
     Returns:
@@ -209,18 +216,27 @@ def merge_adapter(base_model: str, adapter_path: Path, output: Path) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     console.print(f"[cyan]Loading base model on CPU for merge: {base_model}[/cyan]")
     tokenizer = AutoTokenizer.from_pretrained(
-        str(adapter_path), trust_remote_code=True, token=hf_token
+        str(adapter_path), trust_remote_code=trust_remote_code, token=hf_token
     )
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.float16,
         device_map="cpu",
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
         token=hf_token,
     )
     console.print("[cyan]Merging LoRA weights...[/cyan]")
-    model = PeftModel.from_pretrained(model, str(adapter_path))
-    model = model.merge_and_unload()
+    try:
+        model = PeftModel.from_pretrained(model, str(adapter_path))
+        model = model.merge_and_unload()
+    except Exception as e:
+        logger.error("Merge failed for adapter {}: {}", adapter_path, e)
+        raise AftError(
+            f"LoRA merge failed.\n"
+            f"  Adapter: {adapter_path}\n"
+            f"  Output:  {output}\n"
+            f"  Check that the adapter is compatible with the base model."
+        ) from e
     model.save_pretrained(str(output), safe_serialization=True)
     tokenizer.save_pretrained(str(output))
     logger.info("Merged model saved to {}", output)
@@ -245,11 +261,16 @@ def _get_calibration_data(
         texts = [row["text"] for row in data if len(row["text"]) > 50]
     else:
         p = Path(dataset_name)
-        texts = [
-            json.loads(line)["text"]
-            for line in p.read_text().splitlines()
-            if line.strip()
-        ]
+        if not p.exists():
+            raise FileNotFoundError(f"Calibration JSONL not found: {p}")
+        texts = []
+        for i, line in enumerate(p.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if "text" not in row:
+                raise ValueError(f"Calibration JSONL line {i}: missing 'text' key")
+            texts.append(row["text"])
 
     samples = []
     for text in texts[:n_samples]:
@@ -267,6 +288,9 @@ def _get_calibration_data(
 def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
     """Quantize a merged fp16 model to GPTQ Int4 using GPTQModel.
 
+    Runs quantization inside a temporary directory (for gptqmodel temp files)
+    with automatic cleanup on exit.
+
     Returns:
         Path to the quantized model directory (vLLM-ready).
     """
@@ -274,59 +298,77 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
     from gptqmodel import QuantizeConfig as GptqCfg
     from transformers import AutoTokenizer
 
-    _silence_debug_loggers()
+    silence_noisy_loggers()
 
-    # Run from /tmp so gptqmodel writes logs/temp files there
+    # gptqmodel writes intermediate files (logs, temp weights) to the current
+    # working directory.  We chdir into a disposable temp dir so those artefacts
+    # don't pollute the user's project root.  The TemporaryDirectory context
+    # manager guarantees cleanup, and the finally block restores the original cwd
+    # even if quantization raises.
     prev_cwd = os.getcwd()
-    tmp_dir = tempfile.mkdtemp(prefix="gptq_")
-    os.chdir(tmp_dir)
-    logger.debug("Changed working directory to {} for quantization", tmp_dir)
-
     try:
-        hf_token = _hf_token()
-        output.mkdir(parents=True, exist_ok=True)
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(model_path), trust_remote_code=True, token=hf_token
-        )
+        with tempfile.TemporaryDirectory(prefix="gptq_") as tmp_dir:
+            os.chdir(tmp_dir)
+            logger.debug("Changed working directory to {} for quantization", tmp_dir)
 
-        console.print("[cyan]Building calibration dataset...[/cyan]")
-        calibration = _get_calibration_data(
-            tokenizer,
-            config.calibration_dataset,
-            config.n_calibration_samples,
-            config.calibration_seq_len,
-        )
+            hf_token = _hf_token()
+            output.mkdir(parents=True, exist_ok=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                str(model_path),
+                trust_remote_code=config.trust_remote_code,
+                token=hf_token,
+            )
 
-        quant_cfg = GptqCfg(
-            bits=config.bits,
-            group_size=config.group_size,
-            desc_act=config.desc_act,
-        )
-        console.print(f"[cyan]Loading model for quantization: {model_path}[/cyan]")
-        model = GPTQModel.from_pretrained(
-            str(model_path),
-            quantize_config=quant_cfg,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        )
+            console.print("[cyan]Building calibration dataset...[/cyan]")
+            calibration = _get_calibration_data(
+                tokenizer,
+                config.calibration_dataset,
+                config.n_calibration_samples,
+                config.calibration_seq_len,
+            )
 
-        # Disable strict layer matching for hybrid architectures with modules
-        # that gptqmodel doesn't recognize (e.g. linear_attn.conv1d)
-        if hasattr(model, "gptq_model") and model.gptq_model is not None:
-            model.gptq_model.layer_modules_strict = False
+            quant_cfg = GptqCfg(
+                bits=config.bits,
+                group_size=config.group_size,
+                desc_act=config.desc_act,
+            )
+            console.print(f"[cyan]Loading model for quantization: {model_path}[/cyan]")
+            model = GPTQModel.from_pretrained(
+                str(model_path),
+                quantize_config=quant_cfg,
+                torch_dtype=torch.float16,
+                trust_remote_code=config.trust_remote_code,
+            )
 
-        console.print(
-            f"[green]Quantizing → GPTQ Int{config.bits} "
-            f"(group_size={config.group_size})...[/green]"
-        )
-        model.quantize(calibration)
-        model.save_quantized(str(output))
-        tokenizer.save_pretrained(str(output))
+            # Disable strict layer matching for hybrid architectures with modules
+            # that gptqmodel doesn't recognize (e.g. linear_attn.conv1d)
+            if hasattr(model, "gptq_model") and model.gptq_model is not None:
+                model.gptq_model.layer_modules_strict = False
 
-        logger.info("GPTQ Int{} model saved to {}", config.bits, output)
-        console.print(f"[green]✓ GPTQ Int{config.bits} → {output}[/green]")
-        console.print(f"[dim]  vLLM: --model {output} --quantization gptq_marlin[/dim]")
-        return output
+            console.print(
+                f"[cyan]Quantizing → GPTQ Int{config.bits} "
+                f"(group_size={config.group_size})...[/cyan]"
+            )
+            try:
+                model.quantize(calibration)
+            except Exception as e:
+                logger.error("GPTQ quantization failed: {}", e)
+                raise AftError(
+                    f"GPTQ Int{config.bits} quantization failed.\n"
+                    f"  Model:   {model_path}\n"
+                    f"  Output:  {output}\n"
+                    "  Try reducing n_calibration_samples or"
+                    " using a different calibration dataset."
+                ) from e
+            model.save_quantized(str(output))
+            tokenizer.save_pretrained(str(output))
+
+            logger.info("GPTQ Int{} model saved to {}", config.bits, output)
+            console.print(f"[green]✓ GPTQ Int{config.bits} → {output}[/green]")
+            console.print(
+                f"[dim]  vLLM: --model {output} --quantization gptq_marlin[/dim]"
+            )
+            return output
     finally:
         os.chdir(prev_cwd)
 

@@ -11,3 +11,6 @@ build/
 .pytest_cache/
 gptqmodel/
 download.log
+htmlcov/
+.coverage
+coverage.xml

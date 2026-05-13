@@ -53,3 +53,14 @@ select = ["E", "F", "I", "W"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["aft"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short -q"
