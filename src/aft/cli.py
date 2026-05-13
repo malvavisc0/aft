@@ -315,11 +315,13 @@ def run_cmd(
         else:
             if not adapter_dir.exists():
                 console.print(
-                    f"[red]✗ --skip-finetune set but adapter not found: {adapter_dir}[/red]"
+                    f"[red]✗ --skip-finetune set but adapter not found:"
+                    f" {adapter_dir}[/red]"
                 )
                 raise typer.Exit(1)
             console.print(
-                f"[yellow]⚠ Skipping SFT — using existing adapter: {adapter_dir}[/yellow]"
+                f"[yellow]⚠ Skipping SFT — using existing adapter:"
+                f" {adapter_dir}[/yellow]"
             )
 
         # ── Phase 2: Merge LoRA ────────────────────────────────────────
