@@ -244,7 +244,7 @@ def merge_adapter(
     return output
 
 
-# ── Phase 3: GPTQ Int4 Quantization ──────────────────────────────────────
+# ── Phase 3: Quantization (GPTQ / FP8) ───────────────────────────────────
 
 
 def _get_calibration_data(
@@ -253,7 +253,7 @@ def _get_calibration_data(
     n_samples: int,
     seq_len: int,
 ) -> list[dict]:
-    """Build tokenized calibration samples for GPTQ quantization."""
+    """Build tokenized calibration samples for GPTQ / FP8 quantization."""
     import datasets as hf_datasets
 
     if dataset_name == "wikitext2":
@@ -286,7 +286,9 @@ def _get_calibration_data(
 
 
 def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
-    """Quantize a merged fp16 model to GPTQ Int4 using GPTQModel.
+    """Quantize a merged fp16 model using GPTQModel.
+
+    Supports GPTQ (Int4 / Int8) and FP8 via ``config.format``.
 
     Runs quantization inside a temporary directory (for gptqmodel temp files)
     with automatic cleanup on exit.
@@ -299,6 +301,10 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
     from transformers import AutoTokenizer
 
     silence_noisy_loggers()
+
+    is_fp8 = config.format == "fp8"
+    quant_label = "FP8" if is_fp8 else f"GPTQ Int{config.bits}"
+    vllm_quant_arg = "fp8" if is_fp8 else "gptq_marlin"
 
     # gptqmodel writes intermediate files (logs, temp weights) to the current
     # working directory.  We chdir into a disposable temp dir so those artefacts
@@ -327,11 +333,15 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
                 config.calibration_seq_len,
             )
 
-            quant_cfg = GptqCfg(
-                bits=config.bits,
-                group_size=config.group_size,
-                desc_act=config.desc_act,
-            )
+            if is_fp8:
+                quant_cfg = GptqCfg(bits=8, format="fp8")
+            else:
+                quant_cfg = GptqCfg(
+                    bits=config.bits,
+                    group_size=config.group_size,
+                    desc_act=config.desc_act,
+                )
+
             console.print(f"[cyan]Loading model for quantization: {model_path}[/cyan]")
             model = GPTQModel.from_pretrained(
                 str(model_path),
@@ -345,16 +355,14 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
             if hasattr(model, "gptq_model") and model.gptq_model is not None:
                 model.gptq_model.layer_modules_strict = False
 
-            console.print(
-                f"[cyan]Quantizing → GPTQ Int{config.bits} "
-                f"(group_size={config.group_size})...[/cyan]"
-            )
+            extra_info = f"(group_size={config.group_size})" if not is_fp8 else ""
+            console.print(f"[cyan]Quantizing → {quant_label} {extra_info}...[/cyan]")
             try:
                 model.quantize(calibration)
             except Exception as e:
-                logger.error("GPTQ quantization failed: {}", e)
+                logger.error("{} quantization failed: {}", quant_label, e)
                 raise AftError(
-                    f"GPTQ Int{config.bits} quantization failed.\n"
+                    f"{quant_label} quantization failed.\n"
                     f"  Model:   {model_path}\n"
                     f"  Output:  {output}\n"
                     "  Try reducing n_calibration_samples or"
@@ -363,10 +371,10 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
             model.save_quantized(str(output))
             tokenizer.save_pretrained(str(output))
 
-            logger.info("GPTQ Int{} model saved to {}", config.bits, output)
-            console.print(f"[green]✓ GPTQ Int{config.bits} → {output}[/green]")
+            logger.info("{} model saved to {}", quant_label, output)
+            console.print(f"[green]✓ {quant_label} → {output}[/green]")
             console.print(
-                f"[dim]  vLLM: --model {output} --quantization gptq_marlin[/dim]"
+                f"[dim]  vLLM: --model {output} --quantization {vllm_quant_arg}[/dim]"
             )
             return output
     finally:

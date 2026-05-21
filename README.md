@@ -1,22 +1,24 @@
 # aft — Aria Finetuner
 
-**Standalone fine-tuning and GPTQ quantization pipeline for instruction-following models.**
+**Standalone fine-tuning and quantization pipeline for instruction-following models.**
 
-`aft` takes a base model from HuggingFace, fine-tunes it with QLoRA (4-bit NF4), merges the adapter, quantizes to GPTQ Int4, and optionally publishes the result to HuggingFace Hub — all from a single CLI.
+`aft` takes a base model from HuggingFace, fine-tunes it with QLoRA (4-bit NF4),
+merges the adapter, quantizes to GPTQ (Int4/Int8) or FP8, and optionally
+publishes the result to HuggingFace Hub — all from a single CLI.
 
 ## Features
 
 - **QLoRA SFT** — 4-bit NF4 training with LoRA adapters on all attention + MLP layers
 - **Automatic parameter tuning** — detects your GPU and model size, then recommends rank, learning rate, batch size, and sequence length
 - **Dataset cleaning** — whitespace normalization, special-character filtering, token-length bounds, language detection, and deduplication
-- **GPTQ quantization** — Int4 quantization via GPTQModel, producing vLLM-ready checkpoints
+- **Quantization** — GPTQ Int4/Int8 and FP8 quantization via GPTQModel, producing vLLM-ready checkpoints
 - **Hub integration** — push quantized models directly to HuggingFace Hub
 - **Modular pipeline** — run the full stack or individual phases (train, merge, quantize, push)
 - **Resumable runs** — automatically detects completed phases and skips them with `--resume`
 
 ## Requirements
 
-- Python ≥ 3.12
+- Python ≥ 3.14
 - NVIDIA GPU with CUDA support
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
@@ -70,14 +72,26 @@ aft recommend --model Qwen/Qwen2.5-7B --token hf_xxxx
 
 ### `aft run`
 
-Runs the full pipeline: QLoRA SFT → LoRA merge → GPTQ quantization.
+Runs the full pipeline: QLoRA SFT → LoRA merge → quantization.
 
 ```bash
+# GPTQ Int4 (default)
 aft run \
     --model Qwen/Qwen2.5-7B \
     --dataset teknium/OpenHermes-2.5 \
     --run-name my-run \
     --output ./models
+
+# FP8 quantization
+aft run \
+    --model Qwen/Qwen2.5-7B \
+    --dataset teknium/OpenHermes-2.5 \
+    --run-name my-fp8-run \
+    --output ./models \
+    --quant-type fp8
+
+# After FP8 quantization, serve with vLLM:
+# vllm serve ./models/my-fp8-run/fp8 --quantization fp8
 ```
 
 #### Training options
@@ -110,8 +124,8 @@ aft run \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--gptq-bits` | `4` | Quantization bit-width |
-| `--gptq-group-size` | `128` | GPTQ group size |
+| `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
+| `--gptq-group-size` | `128` | GPTQ group size (int4/int8 only) |
 | `--calibration` | `wikitext2` | Calibration dataset (`wikitext2` or path to JSONL) |
 
 #### Pipeline control
@@ -124,19 +138,32 @@ aft run \
 
 ### `aft quantize`
 
-Quantize an already-merged fp16 model to GPTQ Int4.
+Quantize an already-merged fp16 model (GPTQ int4/int8 or FP8).
 
 ```bash
+# GPTQ Int4 (default)
 aft quantize \
     --model ./models/my-run/merged \
     --output ./models/my-run/gptq-int4
+
+# FP8
+aft quantize \
+    --model ./models/my-run/merged \
+    --output ./models/my-run/fp8 \
+    --quant-type fp8
+
+# GPTQ Int8
+aft quantize \
+    --model ./models/my-run/merged \
+    --output ./models/my-run/gptq-int8 \
+    --quant-type int8
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--bits` | `4` | Quantization bit-width |
-| `--group-size` | `128` | GPTQ group size |
-| `--desc-act` | off | Use activation order (slower, better quality) |
+| `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
+| `--group-size` | `128` | GPTQ group size (int4/int8 only) |
+| `--desc-act` | off | Use activation order — slower, better quality (int4/int8 only) |
 | `--calibration` | `wikitext2` | Calibration dataset |
 | `--n-calibration-samples` | `128` | Number of calibration samples |
 | `--calibration-seq-len` | `2048` | Calibration sequence length |
@@ -189,13 +216,20 @@ Models with different layer names (e.g. Mamba, RWKV) will not match these target
 
 ## Serving with vLLM
 
-After quantization, the GPTQ output directory is ready for vLLM:
+After quantization, the output directory is ready for vLLM. The `--quantization` flag
+depends on the quantization type:
 
 ```bash
+# GPTQ Int4 / Int8
 vllm serve ./models/my-run/gptq-int4 --quantization gptq_marlin
+vllm serve ./models/my-run/gptq-int8 --quantization gptq_marlin
+
+# FP8
+vllm serve ./models/my-run/fp8 --quantization fp8
 ```
 
-The `gptq_marlin` kernel provides near-native inference speed for GPTQ-quantized models.
+The `gptq_marlin` kernel provides near-native inference speed for GPTQ-quantized
+models; FP8 requires Hopper GPUs (H100/H200) or newer for optimal performance.
 
 ## Environment Variables
 
@@ -207,13 +241,16 @@ The `gptq_marlin` kernel provides near-native inference speed for GPTQ-quantized
 ## Output Structure
 
 `--output` is the base directory; `--run-name` creates a subdirectory under it.
+The quantized output directory name depends on `--quant-type`:
 
 ```
 <output>/<run-name>/
 ├── adapter/          # LoRA adapter weights
 ├── checkpoints/      # Training checkpoints
 ├── merged/           # Merged fp16 model
-└── gptq-int4/        # GPTQ quantized model (vLLM-ready)
+└── gptq-int4/        # GPTQ Int4 model (default, vLLM-ready)
+    gptq-int8/        # GPTQ Int8 model (--quant-type int8)
+    fp8/              # FP8 model (--quant-type fp8)
 ```
 
 ## Resuming a Run

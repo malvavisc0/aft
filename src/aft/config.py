@@ -38,11 +38,12 @@ class TrainConfig:
 
 @dataclass
 class QuantizeConfig:
-    """GPTQ quantization phase configuration."""
+    """GPTQ / FP8 quantization phase configuration."""
 
     bits: int = 4
     group_size: int = 128
     desc_act: bool = False
+    format: str = "gptq"  # "gptq" | "fp8"
     calibration_dataset: str = "wikitext2"
     n_calibration_samples: int = 128
     calibration_seq_len: int = 2048

@@ -233,7 +233,13 @@ def run_cmd(
     skip_quantize: Annotated[
         bool, typer.Option("--skip-quantize", help="Stop after merge.")
     ] = False,
-    gptq_bits: Annotated[int, typer.Option(help="GPTQ bits.")] = 4,
+    quant_type: Annotated[
+        str,
+        typer.Option(
+            "--quant-type",
+            help="Quantization type: int4, int8, or fp8.",
+        ),
+    ] = "int4",
     gptq_group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
     calibration: Annotated[
         str, typer.Option(help="'wikitext2' or path to JSONL.")
@@ -245,13 +251,30 @@ def run_cmd(
         bool, typer.Option("--resume", help="Skip phases whose output exists.")
     ] = False,
 ) -> None:
-    """Full pipeline: QLoRA SFT → merge LoRA → GPTQ quantize."""
+    """Full pipeline: QLoRA SFT → merge LoRA → quantize."""
     from aft.config import QuantizeConfig, TrainConfig
     from aft.pipeline import AftError, merge_adapter, quantize, train
 
     _banner()
 
-    steps = ["QLoRA SFT", "Merge LoRA", f"GPTQ Int{gptq_bits}"]
+    # Derive bits and format from quant_type
+    if quant_type == "fp8":
+        q_bits = 8
+        q_format = "fp8"
+        q_label = "FP8"
+        q_dir_name = "fp8"
+    elif quant_type == "int8":
+        q_bits = 8
+        q_format = "gptq"
+        q_label = "GPTQ Int8"
+        q_dir_name = "gptq-int8"
+    else:
+        q_bits = 4
+        q_format = "gptq"
+        q_label = "GPTQ Int4"
+        q_dir_name = "gptq-int4"
+
+    steps = ["QLoRA SFT", "Merge LoRA", q_label]
 
     dataset_ids = [d.strip() for d in dataset.split(",") if d.strip()]
     lang_list = (
@@ -263,7 +286,7 @@ def run_cmd(
     base_dir = output / run_name
     adapter_dir = base_dir / "adapter"
     merged_dir = base_dir / "merged"
-    gptq_dir = base_dir / f"gptq-int{gptq_bits}"
+    gptq_dir = base_dir / q_dir_name
 
     # --resume: auto-detect what can be skipped
     skip_merge = False
@@ -349,7 +372,8 @@ def run_cmd(
             merged_dir,
             gptq_dir,
             QuantizeConfig(
-                bits=gptq_bits,
+                bits=q_bits,
+                format=q_format,
                 group_size=gptq_group_size,
                 calibration_dataset=calibration,
                 trust_remote_code=trust_remote_code,
@@ -373,7 +397,7 @@ def run_cmd(
     summary.add_column("Path", style="white")
     summary.add_row("Adapter", str(adapter_dir))
     summary.add_row("Merged", str(merged_dir))
-    summary.add_row(f"GPTQ Int{gptq_bits}", str(gptq_dir))
+    summary.add_row(q_label, str(gptq_dir))
     console.print(Panel(summary, border_style="green", expand=False))
 
 
@@ -385,7 +409,13 @@ def quantize_cmd(
     output: Annotated[
         Path, typer.Option("--output", help="Output directory for quantized model.")
     ],
-    bits: Annotated[int, typer.Option(help="Quantization bits.")] = 4,
+    quant_type: Annotated[
+        str,
+        typer.Option(
+            "--quant-type",
+            help="Quantization type: int4, int8, or fp8.",
+        ),
+    ] = "int4",
     group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
     desc_act: Annotated[
         bool, typer.Option("--desc-act", help="Use activation order (slower, better).")
@@ -403,14 +433,29 @@ def quantize_cmd(
         bool, typer.Option(help="Allow loading models with custom code.")
     ] = False,
 ) -> None:
-    """Quantize an already-merged model to GPTQ Int4."""
+    """Quantize an already-merged model (GPTQ int4/int8 or FP8)."""
     from aft.config import QuantizeConfig
     from aft.pipeline import AftError, quantize
 
     _banner()
 
+    # Derive bits, format, and vLLM flag from quant_type
+    if quant_type == "fp8":
+        q_bits = 8
+        q_format = "fp8"
+        vllm_flag = "fp8"
+    elif quant_type == "int8":
+        q_bits = 8
+        q_format = "gptq"
+        vllm_flag = "gptq_marlin"
+    else:
+        q_bits = 4
+        q_format = "gptq"
+        vllm_flag = "gptq_marlin"
+
     cfg = QuantizeConfig(
-        bits=bits,
+        bits=q_bits,
+        format=q_format,
         group_size=group_size,
         desc_act=desc_act,
         calibration_dataset=calibration,
@@ -425,7 +470,7 @@ def quantize_cmd(
         raise typer.Exit(1) from exc
     console.print(
         Panel(
-            f"[dim]vllm serve {output} --quantization gptq_marlin[/dim]",
+            f"[dim]vllm serve {output} --quantization {vllm_flag}[/dim]",
             title="[bold]🚀 Serve with vLLM[/bold]",
             border_style="yellow",
             expand=False,

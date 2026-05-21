@@ -41,7 +41,7 @@ class TestCliHelp:
         assert result.exit_code == 0
         out = _plain(result.output)
         assert "--model" in out
-        assert "--bits" in out
+        assert "--quant-type" in out
 
     def test_push_help(self) -> None:
         result = runner.invoke(app, ["push", "--help"])
