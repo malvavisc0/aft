@@ -16,6 +16,8 @@ publishes the result to HuggingFace Hub — all from a single CLI.
 - **Modular pipeline** — run the full stack or individual phases (train, merge, quantize, push)
 - **Resumable runs** — automatically detects completed phases and skips them with `--resume`
 
+![Screenshot](https://raw.githubusercontent.com/malvavisc0/aft/refs/heads/master/running.png)
+
 ## Requirements
 
 - Python ≥ 3.14
