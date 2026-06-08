@@ -13,7 +13,7 @@ def detect_system_ram_mib() -> int:
                 if line.startswith("MemTotal:"):
                     kb = int(line.split()[1])
                     return kb // 1024
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError, ValueError:
         pass
     return 0
 

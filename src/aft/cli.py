@@ -83,11 +83,14 @@ def recommend_cmd(
         for i, gpu in enumerate(gpus):
             label = "GPU " if len(gpus) == 1 else f"GPU {i}"
             gpu_str = f"{gpu['name']} [dim]({gpu['vram_mib'] / 1024:.1f} GiB)[/dim]"
-            console.print(f"    [bold cyan]{label}[/bold cyan] [green]{gpu_str}[/green]")
+            console.print(
+                f"    [bold cyan]{label}[/bold cyan] [green]{gpu_str}[/green]"
+            )
         if len(gpus) > 1:
             console.print(
                 f"    [bold cyan]Total VRAM[/bold cyan]  "
-                f"[green]{total_vram_mib / 1024:.1f} GiB across {len(gpus)} GPUs[/green]"
+                f"[green]{total_vram_mib / 1024:.1f} GiB across {len(gpus)} "
+                "GPUs[/green]"
             )
     else:
         console.print("    [bold cyan]GPU[/bold cyan]  [red]None detected[/red]")

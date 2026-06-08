@@ -338,7 +338,9 @@ def _get_calibration_data(
     return samples
 
 
-def quantize(model_path: Path, output: Path, config: QuantizeConfig, *, token: str | None = None) -> Path:
+def quantize(
+    model_path: Path, output: Path, config: QuantizeConfig, *, token: str | None = None
+) -> Path:
     """Quantize a merged fp16 model using GPTQModel.
 
     Supports GPTQ (Int4 / Int8) and FP8 via ``config.format``.
