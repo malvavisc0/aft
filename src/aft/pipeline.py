@@ -213,13 +213,16 @@ def merge_adapter(
     *,
     trust_remote_code: bool = False,
 ) -> Path:
-    """Merge LoRA adapter into the base model as fp16 safetensors.
+    """Merge LoRA adapter into the base model as safetensors.
+
+    The merged model is saved using the base model's native ``torch_dtype``
+    (from its config), falling back to bfloat16 when unspecified.
 
     Returns:
         Path to the merged model directory.
     """
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     hf_token = _hf_token()
     output.mkdir(parents=True, exist_ok=True)
@@ -230,9 +233,15 @@ def merge_adapter(
         token=hf_token,
         fix_mistral_regex=True,
     )
+    hf_config = AutoConfig.from_pretrained(
+        base_model,
+        trust_remote_code=trust_remote_code,
+        token=hf_token,
+    )
+    model_dtype = getattr(hf_config, "torch_dtype", None) or torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=torch.float16,
+        torch_dtype=model_dtype,
         device_map="cpu",
         trust_remote_code=trust_remote_code,
         token=hf_token,
@@ -338,10 +347,85 @@ def _get_calibration_data(
     return samples
 
 
+def _materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
+    """Load real weights for any parameters stuck on the meta device.
+
+    GPTQModel's built-in materialization doesn't handle every architecture
+    (e.g. sparse MoE experts in Mellum).  This detects leftover meta tensors
+    and loads their values from the safetensors checkpoint files.
+
+    Returns the number of parameters that were materialized.
+    """
+    from safetensors.torch import load_file
+
+    meta_params = {
+        name: param for name, param in model.named_parameters() if param.is_meta
+    }
+    if not meta_params:
+        return 0
+
+    meta_names = list(meta_params)
+    logger.warning(
+        "Found {} parameters still on meta device after load: {}",
+        len(meta_params),
+        ", ".join(meta_names[:8]) + ("..." if len(meta_names) > 8 else ""),
+    )
+
+    safetensor_files = sorted(Path(model_path).glob("*.safetensors"))
+    if not safetensor_files:
+        logger.error(
+            "No .safetensors files found in {} -- cannot materialize", model_path
+        )
+        return 0
+
+    # Search shards lazily: load one at a time and extract only the weights we
+    # still need, so peak memory stays proportional to the largest single shard
+    # rather than the whole (already-loaded) model.
+    needed = set(meta_names)
+    found: dict[str, torch.Tensor] = {}
+    for shard in safetensor_files:
+        if not needed:
+            break
+        weights = load_file(str(shard), device="cpu")
+        for key in needed & weights.keys():
+            found[key] = weights[key]
+        needed -= found.keys()
+
+    materialized = 0
+    for name in meta_names:
+        param = meta_params[name]
+        if name not in found:
+            logger.warning("Meta param '{}' not found in checkpoint -- skipping", name)
+            continue
+
+        # Walk the module tree to replace the parameter in-place.
+        parts = name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+
+        # A meta tensor's reported dtype can be an unreliable default (often
+        # float32); trust the checkpoint's dtype unless the model explicitly
+        # asks for something other than float32.
+        target_dtype = (
+            param.dtype if param.dtype != torch.float32 else found[name].dtype
+        )
+        new_param = torch.nn.Parameter(
+            found[name].to(dtype=target_dtype),
+            requires_grad=param.requires_grad,
+        )
+        setattr(parent, parts[-1], new_param)
+        materialized += 1
+
+    if materialized:
+        logger.info("Materialized {} meta parameters from checkpoint", materialized)
+    return materialized
+
+
 def quantize(
     model_path: Path, output: Path, config: QuantizeConfig, *, token: str | None = None
 ) -> Path:
-    """Quantize a merged fp16 model using GPTQModel.
+    """Quantize a merged model using GPTQModel.
 
     Supports GPTQ (Int4 / Int8) and FP8 via ``config.format``.
 
@@ -353,7 +437,7 @@ def quantize(
     """
     from gptqmodel import GPTQModel
     from gptqmodel import QuantizeConfig as GptqCfg
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
     silence_noisy_loggers()
 
@@ -406,12 +490,22 @@ def quantize(
                 )
 
             console.print(f"[cyan]Loading model for quantization: {model_path}[/cyan]")
+            hf_config = AutoConfig.from_pretrained(
+                str(model_path),
+                trust_remote_code=config.trust_remote_code,
+                token=hf_token,
+            )
+            model_dtype = getattr(hf_config, "torch_dtype", None) or torch.bfloat16
             model = GPTQModel.from_pretrained(
                 str(model_path),
                 quantize_config=quant_cfg,
-                torch_dtype=torch.float16,
+                torch_dtype=model_dtype,
                 trust_remote_code=config.trust_remote_code,
             )
+
+            # Materialize any parameters GPTQModel left on the meta device
+            # (e.g. sparse MoE experts that its loader doesn't handle).
+            _materialize_meta_params(model, model_path)
 
             # Disable strict layer matching for hybrid architectures with modules
             # that gptqmodel doesn't recognize (e.g. linear_attn.conv1d)
