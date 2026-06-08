@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import torch
 from loguru import logger
@@ -60,6 +61,7 @@ def train(config: TrainConfig) -> Path:
         config.base_model,
         trust_remote_code=config.trust_remote_code,
         token=hf_token,
+        fix_mistral_regex=True,
     )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -71,7 +73,7 @@ def train(config: TrainConfig) -> Path:
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
-    model_kwargs: dict = dict(
+    model_kwargs: dict[str, Any] = dict(
         quantization_config=bnb,
         device_map="auto",
         trust_remote_code=config.trust_remote_code,
@@ -80,7 +82,10 @@ def train(config: TrainConfig) -> Path:
     )
     if config.max_memory is not None:
         model_kwargs["max_memory"] = config.max_memory
+        logger.debug("Using max_memory: {}", config.max_memory)
     model = AutoModelForCausalLM.from_pretrained(config.base_model, **model_kwargs)
+    # Disable gradient checkpointing here; SFTConfig will handle it via
+    # the ``gradient_checkpointing`` kwarg to avoid double-wrapping.
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
 
     lora_cfg = LoraConfig(
@@ -117,8 +122,12 @@ def train(config: TrainConfig) -> Path:
                 all_texts.append("\n".join(parts))
         else:
             cols = ds.column_names
-            logger.warning("Dataset {} has no 'text' column. Columns: {}", ds_id, cols)
-            all_texts.extend(ds[cols[0]])
+            raise AftError(
+                f"Dataset '{ds_id}' has no 'text' or 'conversations' column.\n"
+                f"  Available columns: {cols}\n"
+                f"  Ensure the dataset has a 'text' column or a"
+                f" 'conversations' column with role/content fields."
+            )
 
     dataset = hf_datasets.Dataset.from_dict({"text": all_texts})
     if config.max_samples:
@@ -185,7 +194,7 @@ def train(config: TrainConfig) -> Path:
         raise AftError(
             f"QLoRA training failed. Check logs above for details.\n"
             f"  Adapter dir: {adapter_dir}\n"
-            f"  To resume, fix the issue and re-run with --resume."
+            f"  To resume, fix the issue and re-run."
         ) from e
     trainer.save_model(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
@@ -216,7 +225,10 @@ def merge_adapter(
     output.mkdir(parents=True, exist_ok=True)
     console.print(f"[cyan]Loading base model on CPU for merge: {base_model}[/cyan]")
     tokenizer = AutoTokenizer.from_pretrained(
-        str(adapter_path), trust_remote_code=trust_remote_code, token=hf_token
+        str(adapter_path),
+        trust_remote_code=trust_remote_code,
+        token=hf_token,
+        fix_mistral_regex=True,
     )
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
@@ -247,33 +259,72 @@ def merge_adapter(
 # ── Phase 3: Quantization (GPTQ / FP8) ───────────────────────────────────
 
 
+_MIN_CALIBRATION_TEXT_LEN = 100
+"""Minimum character length for calibration text samples."""
+
+
 def _get_calibration_data(
-    tokenizer,
+    tokenizer: Any,
     dataset_name: str,
     n_samples: int,
     seq_len: int,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Build tokenized calibration samples for GPTQ / FP8 quantization."""
     import datasets as hf_datasets
 
-    if dataset_name == "wikitext2":
-        data = hf_datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-        texts = [row["text"] for row in data if len(row["text"]) > 50]
+    # Map well-known short names to HuggingFace dataset IDs.
+    _HF_CALIBRATION_DATASETS: dict[str, str] = {
+        "fineweb": "HuggingFaceFW/fineweb",
+        "fineweb-edu": "HuggingFaceFW/fineweb-edu",
+        "c4": "allenai/c4",
+    }
+
+    if dataset_name in _HF_CALIBRATION_DATASETS:
+        hf_repo = _HF_CALIBRATION_DATASETS[dataset_name]
+        console.print(
+            f"[cyan]Loading {hf_repo} for calibration ({n_samples} samples)...[/cyan]"
+        )
+
+        data = hf_datasets.load_dataset(
+            hf_repo,
+            split="train",
+            streaming=True,
+        )
+
+        texts: list[str] = []
+        for row in data:
+            text = row["text"].strip()
+            if len(text) > _MIN_CALIBRATION_TEXT_LEN:
+                texts.append(text)
+            if len(texts) >= n_samples:
+                break
+
     else:
+        # Local JSONL fallback
         p = Path(dataset_name)
         if not p.exists():
-            raise FileNotFoundError(f"Calibration JSONL not found: {p}")
+            raise AftError(f"Calibration JSONL not found: {p}")
+
         texts = []
         for i, line in enumerate(p.read_text().splitlines(), 1):
-            if not line.strip():
+            line = line.strip()
+            if not line:
                 continue
-            row = json.loads(line)
-            if "text" not in row:
-                raise ValueError(f"Calibration JSONL line {i}: missing 'text' key")
-            texts.append(row["text"])
+            try:
+                row = json.loads(line)
+                if "text" not in row:
+                    raise AftError(
+                        f"Calibration JSONL line {i}: missing 'text' key in {p}"
+                    )
+                texts.append(row["text"])
+            except json.JSONDecodeError as exc:
+                raise AftError(
+                    f"Calibration JSONL line {i}: invalid JSON in {p}"
+                ) from exc
 
-    samples = []
-    for text in texts[:n_samples]:
+    # Tokenize
+    samples: list[dict[str, Any]] = []
+    for text in texts:
         enc = tokenizer(
             text,
             return_tensors="pt",
@@ -282,10 +333,12 @@ def _get_calibration_data(
             padding=False,
         )
         samples.append({k: v.squeeze(0) for k, v in enc.items()})
+
+    console.print(f"[cyan]Prepared {len(samples)} calibration samples.[/cyan]")
     return samples
 
 
-def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
+def quantize(model_path: Path, output: Path, config: QuantizeConfig, *, token: str | None = None) -> Path:
     """Quantize a merged fp16 model using GPTQModel.
 
     Supports GPTQ (Int4 / Int8) and FP8 via ``config.format``.
@@ -302,6 +355,13 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
 
     silence_noisy_loggers()
 
+    _VALID_FORMATS = {"gptq", "fp8"}
+    if config.format not in _VALID_FORMATS:
+        raise AftError(
+            f"Unknown quantization format '{config.format}'.\n"
+            f"  Valid options: {', '.join(sorted(_VALID_FORMATS))}"
+        )
+
     is_fp8 = config.format == "fp8"
     quant_label = "FP8" if is_fp8 else f"GPTQ Int{config.bits}"
     vllm_quant_arg = "fp8" if is_fp8 else "gptq_marlin"
@@ -317,12 +377,13 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig) -> Path:
             os.chdir(tmp_dir)
             logger.debug("Changed working directory to {} for quantization", tmp_dir)
 
-            hf_token = _hf_token()
+            hf_token = token or _hf_token()
             output.mkdir(parents=True, exist_ok=True)
             tokenizer = AutoTokenizer.from_pretrained(
                 str(model_path),
                 trust_remote_code=config.trust_remote_code,
                 token=hf_token,
+                fix_mistral_regex=True,
             )
 
             console.print("[cyan]Building calibration dataset...[/cyan]")
@@ -389,7 +450,7 @@ def push_to_hub(
     repo_id: str,
     private: bool = False,
     token: str | None = None,
-    commit_message: str = "Upload GPTQ quantized model",
+    commit_message: str = "Upload quantized model",
 ) -> str:
     """Push a quantized model directory to HuggingFace Hub.
 

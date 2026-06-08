@@ -32,7 +32,7 @@ dependencies = [
 aft = "aft:main"
 
 [build-system]
-requires = ["setuptools>=75.0"]
+requires = ["setuptools>=82.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

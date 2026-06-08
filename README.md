@@ -126,7 +126,7 @@ aft run \
 |------|---------|-------------|
 | `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
 | `--gptq-group-size` | `128` | GPTQ group size (int4/int8 only) |
-| `--calibration` | `wikitext2` | Calibration dataset (`wikitext2` or path to JSONL) |
+| `--calibration` | `fineweb-edu` | Calibration dataset (`fineweb-edu` or path to JSONL) |
 
 #### Pipeline control
 
@@ -164,7 +164,7 @@ aft quantize \
 | `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
 | `--group-size` | `128` | GPTQ group size (int4/int8 only) |
 | `--desc-act` | off | Use activation order — slower, better quality (int4/int8 only) |
-| `--calibration` | `wikitext2` | Calibration dataset |
+| `--calibration` | `fineweb-edu` | Calibration dataset |
 | `--n-calibration-samples` | `128` | Number of calibration samples |
 | `--calibration-seq-len` | `2048` | Calibration sequence length |
 | `--trust-remote-code` | off | Allow loading models with custom code |

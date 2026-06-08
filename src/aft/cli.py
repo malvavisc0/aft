@@ -72,7 +72,7 @@ def recommend_cmd(
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 name = torch.cuda.get_device_name(i)
-                mem = torch.cuda.get_device_properties(i).total_mem // (1024 * 1024)
+                mem = torch.cuda.get_device_properties(i).total_memory // (1024 * 1024)
                 gpus.append({"name": name, "vram_mib": int(mem)})
         total_vram_mib = sum(g["vram_mib"] for g in gpus)
         total_ram_mib = detect_system_ram_mib()
@@ -80,11 +80,15 @@ def recommend_cmd(
 
     console.print("  [bold cyan]⚡ Hardware[/bold cyan]")
     if gpus:
-        gpu = gpus[0]
-        gpu_str = f"{gpu['name']} [dim]({gpu['vram_mib'] / 1024:.1f} GiB VRAM)[/dim]"
-        console.print(f"    [bold cyan]GPU[/bold cyan]  [green]{gpu_str}[/green]")
+        for i, gpu in enumerate(gpus):
+            label = "GPU " if len(gpus) == 1 else f"GPU {i}"
+            gpu_str = f"{gpu['name']} [dim]({gpu['vram_mib'] / 1024:.1f} GiB)[/dim]"
+            console.print(f"    [bold cyan]{label}[/bold cyan] [green]{gpu_str}[/green]")
         if len(gpus) > 1:
-            console.print(f"    [bold cyan]GPUs[/bold cyan] [green]{len(gpus)}[/green]")
+            console.print(
+                f"    [bold cyan]Total VRAM[/bold cyan]  "
+                f"[green]{total_vram_mib / 1024:.1f} GiB across {len(gpus)} GPUs[/green]"
+            )
     else:
         console.print("    [bold cyan]GPU[/bold cyan]  [red]None detected[/red]")
     bf16_str = "[green]✓[/green]" if bf16 else "[red]✗[/red]"
@@ -140,6 +144,7 @@ def recommend_cmd(
             vram_mib=total_vram_mib or 24 * 1024,
             ram_mib=total_ram_mib,
             bf16_supported=bf16,
+            gpu_vram_mib=[g["vram_mib"] for g in gpus] or None,
         )
 
     rec_table = Table(
@@ -240,10 +245,10 @@ def run_cmd(
             help="Quantization type: int4, int8, or fp8.",
         ),
     ] = "int4",
-    gptq_group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
+    gptq_group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 32,
     calibration: Annotated[
-        str, typer.Option(help="'wikitext2' or path to JSONL.")
-    ] = "wikitext2",
+        str, typer.Option(help="'fineweb-edu' or path to JSONL.")
+    ] = "fineweb-edu",
     trust_remote_code: Annotated[
         bool, typer.Option(help="Allow loading models with custom code.")
     ] = False,
@@ -416,22 +421,26 @@ def quantize_cmd(
             help="Quantization type: int4, int8, or fp8.",
         ),
     ] = "int4",
-    group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
+    group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 32,
     desc_act: Annotated[
         bool, typer.Option("--desc-act", help="Use activation order (slower, better).")
     ] = False,
     calibration: Annotated[
-        str, typer.Option(help="'wikitext2' or path to JSONL.")
-    ] = "wikitext2",
+        str, typer.Option(help="'fineweb-edu' or path to JSONL.")
+    ] = "fineweb-edu",
     n_calibration_samples: Annotated[
         int, typer.Option(help="Number of calibration samples.")
-    ] = 128,
+    ] = 512,
     calibration_seq_len: Annotated[
         int, typer.Option(help="Calibration sequence length.")
     ] = 2048,
     trust_remote_code: Annotated[
         bool, typer.Option(help="Allow loading models with custom code.")
     ] = False,
+    token: Annotated[
+        str | None,
+        typer.Option("--token", help="HF API token. Falls back to HF_TOKEN."),
+    ] = None,
 ) -> None:
     """Quantize an already-merged model (GPTQ int4/int8 or FP8)."""
     from aft.config import QuantizeConfig
@@ -464,7 +473,7 @@ def quantize_cmd(
         trust_remote_code=trust_remote_code,
     )
     try:
-        quantize(merged_model, output, cfg)
+        quantize(merged_model, output, cfg, token=token)
     except AftError as exc:
         console.print(f"\n[red]✗ {exc}[/red]")
         raise typer.Exit(1) from exc

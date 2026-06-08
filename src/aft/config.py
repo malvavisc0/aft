@@ -41,13 +41,13 @@ class QuantizeConfig:
     """GPTQ / FP8 quantization phase configuration."""
 
     bits: int = 4
-    group_size: int = 128
+    group_size: int = 32
     desc_act: bool = False
     format: str = "gptq"  # "gptq" | "fp8"
-    calibration_dataset: str = "wikitext2"
-    n_calibration_samples: int = 128
+    calibration_dataset: str = "fineweb-edu"
+    n_calibration_samples: int = 512
     calibration_seq_len: int = 2048
-    trust_remote_code: bool = False
+    trust_remote_code: bool = True
 
 
 @dataclass

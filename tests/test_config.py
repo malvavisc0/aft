@@ -55,12 +55,12 @@ class TestQuantizeConfigDefaults:
     def test_defaults(self) -> None:
         cfg = QuantizeConfig()
         assert cfg.bits == 4
-        assert cfg.group_size == 128
+        assert cfg.group_size == 32
         assert cfg.desc_act is False
-        assert cfg.calibration_dataset == "wikitext2"
-        assert cfg.n_calibration_samples == 128
+        assert cfg.calibration_dataset == "fineweb-edu"
+        assert cfg.n_calibration_samples == 512
         assert cfg.calibration_seq_len == 2048
-        assert cfg.trust_remote_code is False
+        assert cfg.trust_remote_code is True
 
     def test_custom_values(self) -> None:
         cfg = QuantizeConfig(bits=8, trust_remote_code=True)

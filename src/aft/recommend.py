@@ -13,7 +13,7 @@ def detect_system_ram_mib() -> int:
                 if line.startswith("MemTotal:"):
                     kb = int(line.split()[1])
                     return kb // 1024
-    except FileNotFoundError, ValueError:
+    except (FileNotFoundError, ValueError):
         pass
     return 0
 
@@ -58,6 +58,7 @@ def recommend(
     vram_mib: int,
     ram_mib: int,
     bf16_supported: bool,
+    gpu_vram_mib: list[int] | None = None,
 ) -> Recommendation:
     """Compute recommended QLoRA SFT parameters for the given hardware.
 
@@ -66,6 +67,8 @@ def recommend(
         vram_mib: Total GPU VRAM in MiB.
         ram_mib: Total system RAM in MiB.
         bf16_supported: Whether the GPU supports BF16.
+        gpu_vram_mib: Per-GPU VRAM list in MiB. When provided,
+            ``max_memory`` will set per-device limits for each GPU.
 
     Returns:
         A :class:`Recommendation` with hyper-parameters and reasoning.
@@ -76,6 +79,12 @@ def recommend(
     ram_gib = ram_mib / 1024
 
     reasoning.append(f"Model ~{params_b:.1f}B params on {vram_gib:.1f} GiB VRAM")
+    if gpu_vram_mib and len(gpu_vram_mib) > 1:
+        reasoning.append(
+            f"Multi-GPU: {len(gpu_vram_mib)} GPUs"
+            f" ({', '.join(f'{v / 1024:.0f} GiB' for v in gpu_vram_mib)})"
+            f" → model shards via device_map='auto'"
+        )
 
     # ── Size-based LoRA + LR heuristics ────────────────────────────────
     if params_b < 3:
@@ -119,10 +128,13 @@ def recommend(
     if remaining_gib < 1.0:
         max_seq_len = 512
         batch_size = 1
-        max_memory = {
-            "0": f"{int(vram_gib * 0.9)}GiB",
-            "cpu": f"{int(ram_gib * 0.8)}GiB",
-        }
+        max_memory: dict[str, str] = {}
+        if gpu_vram_mib:
+            for i, vram in enumerate(gpu_vram_mib):
+                max_memory[str(i)] = f"{int(vram / 1024 * 0.9)}GiB"
+        else:
+            max_memory["0"] = f"{int(vram_gib * 0.9)}GiB"
+        max_memory["cpu"] = f"{int(ram_gib * 0.8)}GiB"
         reasoning.append(
             f"VRAM very tight ({remaining_gib:.1f} GiB after weights) - "
             f"seq_len={max_seq_len}, batch=1, CPU offload enabled"
