@@ -145,6 +145,19 @@ aft run \
 
 Quantize an already-merged fp16 model (GPTQ int4/int8 or FP8).
 
+> **`--model` must be a local directory**, not a HuggingFace repo ID. It
+> expects a fully-merged fp16/bf16 checkpoint (safetensors + config) on
+> disk — typically the output of `aft run`/`aft merge`, or an existing
+> model pulled straight from the Hub. If you want to quantize a model
+> that only exists on the Hub (no fine-tuning of your own), download it
+> locally first with the `hf` CLI:
+>
+> ```bash
+> hf download <org>/<model> --local-dir ./models/<model>-src
+> ```
+>
+> Then pass that local directory as `--model` below.
+
 ```bash
 # GPTQ Int4 (default)
 aft quantize \
