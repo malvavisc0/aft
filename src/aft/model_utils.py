@@ -413,6 +413,33 @@ def _install_meta_tensor(
     return count
 
 
+def _recompute_rope_buffers(model: torch.nn.Module) -> int:
+    """Recompute rotary-embedding ``inv_freq`` buffers left on the meta device.
+
+    These are never stored in checkpoints — every HF ``RotaryEmbedding``
+    computes them at ``__init__`` via ``self.rope_init_fn(config, device)``.
+    Loaders that construct the model lazily/on the meta device skip that
+    computation, so recompute it directly instead of pretending it's a
+    missing checkpoint weight.
+    """
+    fixed = 0
+    for name, module in model.named_modules():
+        buf = getattr(module, "inv_freq", None)
+        if buf is None or not buf.is_meta:
+            continue
+        rope_init_fn = getattr(module, "rope_init_fn", None)
+        config = getattr(module, "config", None)
+        if rope_init_fn is None or config is None:
+            raise AftError(
+                f"'{name}.inv_freq' is on the meta device and this module has"
+                " no rope_init_fn/config to recompute it from."
+            )
+        inv_freq, _attention_scaling = rope_init_fn(config, torch.device("cpu"))
+        module.register_buffer("inv_freq", inv_freq, persistent=False)
+        fixed += 1
+    return fixed
+
+
 def materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
     """Load real weights for any parameters/buffers stuck on the meta device.
 
@@ -420,11 +447,14 @@ def materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
     experts in particular).  This resolves the leftover meta tensors through
     the safetensors *index map*, covers buffers as well as parameters, and
     preserves tied-weight identity so that two names pointing at one storage
-    stay tied after replacement.
+    stay tied after replacement.  Rotary-embedding ``inv_freq`` buffers are
+    never in the checkpoint and are recomputed directly instead.
 
     Returns the number of tensors that were materialized.
     """
     from safetensors.torch import load_file
+
+    _recompute_rope_buffers(model)
 
     meta_params = {name: p for name, p in model.named_parameters() if p.is_meta}
     meta_buffers = {name: b for name, b in model.named_buffers() if b.is_meta}
