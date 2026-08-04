@@ -254,6 +254,15 @@ def quantize(
 ) -> Path:
     """Quantize a merged model using GPTQModel."""
     silence_noisy_loggers()
+    # Resolve to absolute paths *before* chdir-ing into the tempdir below —
+    # otherwise a relative --model/--output/JSONL-calibration path silently
+    # breaks once cwd moves.
+    model_path = Path(model_path).resolve()
+    output = Path(output).resolve()
+    from aft.quantize import _HF_CALIBRATION_DATASETS
+
+    if config.calibration_dataset not in _HF_CALIBRATION_DATASETS:
+        config.calibration_dataset = str(Path(config.calibration_dataset).resolve())
     is_fp8, quant_label, vllm_quant_arg = validate_quant_config(config)
     prev_cwd = os.getcwd()
     try:
