@@ -26,7 +26,6 @@ from aft.model_utils import (
 from aft.quantize import report_layer_coverage
 
 
-
 class TestResolveDtype:
     def test_reads_modern_dtype_key(self) -> None:
         cfg = SimpleNamespace(dtype="bfloat16")
@@ -142,9 +141,7 @@ class TestReportLayerCoverage:
 
 
 class TestShardsFor:
-    def test_uses_index_map_to_select_only_needed_shards(
-        self, tmp_path: Path
-    ) -> None:
+    def test_uses_index_map_to_select_only_needed_shards(self, tmp_path: Path) -> None:
         (tmp_path / "model-00001.safetensors").touch()
         (tmp_path / "model-00002.safetensors").touch()
         (tmp_path / "model.safetensors.index.json").write_text(
@@ -163,16 +160,12 @@ class TestShardsFor:
 
     def test_falls_back_to_glob_without_index(self, tmp_path: Path) -> None:
         (tmp_path / "model.safetensors").touch()
-        assert shards_for(tmp_path, {"a.weight"}) == [
-            tmp_path / "model.safetensors"
-        ]
+        assert shards_for(tmp_path, {"a.weight"}) == [tmp_path / "model.safetensors"]
 
     def test_raises_on_malformed_index(self, tmp_path: Path) -> None:
         """A corrupt index file should raise, not silently fall back."""
         (tmp_path / "model.safetensors").touch()
-        (tmp_path / "model.safetensors.index.json").write_text(
-            "this is not valid json"
-        )
+        (tmp_path / "model.safetensors.index.json").write_text("this is not valid json")
         with pytest.raises(AftError, match="Malformed safetensors index"):
             shards_for(tmp_path, {"a.weight"})
 

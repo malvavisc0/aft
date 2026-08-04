@@ -197,9 +197,7 @@ def load_processor(
                 f"  The vision path cannot be silently dropped — the"
                 f" output artifact would be unloadable for serving."
             ) from exc
-    return AutoTokenizer.from_pretrained(
-        model_ref, fix_mistral_regex=True, **kwargs
-    )
+    return AutoTokenizer.from_pretrained(model_ref, fix_mistral_regex=True, **kwargs)
 
 
 def tokenizer_of(processor: Any) -> Any:
@@ -268,9 +266,7 @@ def discover_lora_targets(
             continue
         linear_leaf_names.add(name.split(".")[-1])
 
-    targets = sorted(
-        n for n in linear_leaf_names if n in LORA_CANDIDATE_SUFFIXES
-    )
+    targets = sorted(n for n in linear_leaf_names if n in LORA_CANDIDATE_SUFFIXES)
     if not targets:
         raise AftError(
             "Could not discover any LoRA target modules on this model.\n"
@@ -283,18 +279,14 @@ def discover_lora_targets(
 
     missing = sorted(set(LORA_CANDIDATE_SUFFIXES) - linear_leaf_names)
     logger.info("Discovered LoRA target modules: {}", ", ".join(targets))
-    logger.debug(
-        "Candidate names not present on this model: {}", ", ".join(missing)
-    )
+    logger.debug("Candidate names not present on this model: {}", ", ".join(missing))
     return targets
 
 
 # ── Auxiliary file copying ────────────────────────────────────────────────
 
 
-def copy_auxiliary_files(
-    source: str | Path, destination: Path
-) -> list[str]:
+def copy_auxiliary_files(source: str | Path, destination: Path) -> list[str]:
     """Copy processor/chat-template files from a local model dir to the output.
 
     ``save_pretrained`` on the model and tokenizer does not emit these, so
@@ -334,18 +326,14 @@ def shards_for(model_path: Path, needed: set[str]) -> list[Path]:
     index_path = model_path / "model.safetensors.index.json"
     if index_path.is_file():
         try:
-            weight_map = json.loads(index_path.read_text()).get(
-                "weight_map", {}
-            )
+            weight_map = json.loads(index_path.read_text()).get("weight_map", {})
         except json.JSONDecodeError as exc:
             raise AftError(
                 f"Malformed safetensors index: {index_path}\n"
                 f"  The file exists but could not be parsed as JSON.\n"
                 f"  This usually means the checkpoint is corrupted."
             ) from exc
-        shard_names = {
-            weight_map[name] for name in needed if name in weight_map
-        }
+        shard_names = {weight_map[name] for name in needed if name in weight_map}
         missing = needed - set(weight_map)
         if missing:
             logger.warning(
@@ -384,9 +372,7 @@ def _install_meta_tensor(
     count = 0
     if value is None:
         target_dtype = (
-            old_tensor.dtype
-            if old_tensor.dtype != torch.float32
-            else found[name].dtype
+            old_tensor.dtype if old_tensor.dtype != torch.float32 else found[name].dtype
         )
         value = found[name].to(dtype=target_dtype)
         tied[storage_key] = value
@@ -396,18 +382,14 @@ def _install_meta_tensor(
         setattr(
             parent,
             parts[-1],
-            torch.nn.Parameter(
-                value, requires_grad=old_tensor.requires_grad
-            ),
+            torch.nn.Parameter(value, requires_grad=old_tensor.requires_grad),
         )
     else:
         parent.register_buffer(parts[-1], value)
     return count
 
 
-def materialize_meta_params(
-    model: torch.nn.Module, model_path: Path
-) -> int:
+def materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
     """Load real weights for any parameters/buffers stuck on the meta device.
 
     GPTQModel's loader does not materialize every architecture (sparse MoE
@@ -420,23 +402,17 @@ def materialize_meta_params(
     """
     from safetensors.torch import load_file
 
-    meta_params = {
-        name: p for name, p in model.named_parameters() if p.is_meta
-    }
-    meta_buffers = {
-        name: b for name, b in model.named_buffers() if b.is_meta
-    }
+    meta_params = {name: p for name, p in model.named_parameters() if p.is_meta}
+    meta_buffers = {name: b for name, b in model.named_buffers() if b.is_meta}
     if not meta_params and not meta_buffers:
         return 0
 
     all_names = list(meta_params) + list(meta_buffers)
     logger.warning(
-        "Found {} parameters and {} buffers on the meta device"
-        " after load: {}",
+        "Found {} parameters and {} buffers on the meta device after load: {}",
         len(meta_params),
         len(meta_buffers),
-        ", ".join(all_names[:8])
-        + ("..." if len(all_names) > 8 else ""),
+        ", ".join(all_names[:8]) + ("..." if len(all_names) > 8 else ""),
     )
 
     shards = shards_for(model_path, set(all_names))
@@ -484,9 +460,7 @@ def materialize_meta_params(
             f" after materialization: {', '.join(remaining[:8])}"
         )
 
-    logger.info(
-        "Materialized {} meta tensors from checkpoint", materialized
-    )
+    logger.info("Materialized {} meta tensors from checkpoint", materialized)
     return materialized
 
 

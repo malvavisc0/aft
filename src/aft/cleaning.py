@@ -5,10 +5,8 @@ import re
 
 from loguru import logger
 
-from aft.ui import console
 from aft.errors import AftError
-
-
+from aft.ui import console
 
 
 def clean_dataset(

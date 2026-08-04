@@ -76,8 +76,7 @@ def get_calibration_data(
     if dataset_name in _HF_CALIBRATION_DATASETS:
         hf_repo = _HF_CALIBRATION_DATASETS[dataset_name]
         console.print(
-            f"[cyan]Loading {hf_repo} for calibration"
-            f" ({n_samples} samples)...[/cyan]"
+            f"[cyan]Loading {hf_repo} for calibration ({n_samples} samples)...[/cyan]"
         )
 
         data = hf_datasets.load_dataset(
@@ -109,8 +108,7 @@ def get_calibration_data(
                 row = json.loads(line)
                 if "text" not in row:
                     raise AftError(
-                        f"Calibration JSONL line {i}:"
-                        f" missing 'text' key in {p}"
+                        f"Calibration JSONL line {i}: missing 'text' key in {p}"
                     )
                 texts.append(row["text"])
             except json.JSONDecodeError as exc:
@@ -127,17 +125,14 @@ def get_calibration_data(
         )
     if len(texts) < n_samples:
         logger.warning(
-            "Only {} of the requested {} calibration samples were"
-            " available",
+            "Only {} of the requested {} calibration samples were available",
             len(texts),
             n_samples,
         )
 
     if use_chat_template:
         if getattr(tokenizer, "chat_template", None):
-            console.print(
-                "[cyan]Applying the model's chat template.[/cyan]"
-            )
+            console.print("[cyan]Applying the model's chat template.[/cyan]")
             texts = [apply_chat_template(tokenizer, t) for t in texts]
         else:
             logger.warning(
@@ -169,9 +164,7 @@ def get_calibration_data(
     if not samples:
         raise AftError("All calibration samples tokenized to zero tokens.")
 
-    console.print(
-        f"[cyan]Prepared {len(samples)} calibration samples.[/cyan]"
-    )
+    console.print(f"[cyan]Prepared {len(samples)} calibration samples.[/cyan]")
     return samples
 
 
@@ -359,9 +352,7 @@ def load_model_for_quantization(
             desc_act=config.desc_act,
         )
 
-    console.print(
-        f"[cyan]Loading model for quantization: {model_path}[/cyan]"
-    )
+    console.print(f"[cyan]Loading model for quantization: {model_path}[/cyan]")
     model_dtype = resolve_dtype(hf_config)
     logger.info("Quantizing from dtype {}", model_dtype)
     try:
@@ -414,6 +405,5 @@ def save_quantized_artifact(
     logger.info("{} model saved to {}", quant_label, output)
     console.print(f"[green]✓ {quant_label} → {output}[/green]")
     console.print(
-        f"[dim]  vLLM: --model {output}"
-        f" --quantization {vllm_quant_arg}[/dim]"
+        f"[dim]  vLLM: --model {output} --quantization {vllm_quant_arg}[/dim]"
     )

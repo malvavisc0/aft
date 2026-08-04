@@ -53,7 +53,11 @@ def train(config: TrainConfig) -> Path:
     silence_noisy_loggers()
 
     hf_token = _hf_token()
-    out = Path(config.output_dir) if config.output_dir else Path("models") / config.run_name
+    out = (
+        Path(config.output_dir)
+        if config.output_dir
+        else Path("models") / config.run_name
+    )
     adapter_dir = out / "adapter"
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,7 +70,7 @@ def train(config: TrainConfig) -> Path:
 
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is None:
-            raise AftError(f"Tokenizer has neither pad_token nor eos_token.")
+            raise AftError("Tokenizer has neither pad_token nor eos_token.")
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
@@ -121,14 +125,21 @@ def train(config: TrainConfig) -> Path:
 
     if config.clean:
         dataset = clean_dataset(
-            dataset, tokenizer, dedup=config.dedup,
+            dataset,
+            tokenizer,
+            dedup=config.dedup,
             min_tokens=config.min_tokens,
             max_tokens=config.max_tokens or config.max_seq_len,
             languages=config.languages,
             max_special_ratio=config.max_special_ratio,
         )
 
-    _total_steps = max(1, len(dataset) * config.num_epochs // (config.per_device_batch_size * config.gradient_accumulation_steps))
+    _total_steps = max(
+        1,
+        len(dataset)
+        * config.num_epochs
+        // (config.per_device_batch_size * config.gradient_accumulation_steps),
+    )
     _warmup_steps = max(1, int(_total_steps * config.warmup_ratio))
     bf16_ok = torch.cuda.is_bf16_supported()
 
@@ -139,18 +150,23 @@ def train(config: TrainConfig) -> Path:
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         warmup_steps=_warmup_steps,
-        bf16=bf16_ok, fp16=not bf16_ok,
+        bf16=bf16_ok,
+        fp16=not bf16_ok,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",
-        logging_steps=10, save_strategy="epoch", report_to="none",
+        logging_steps=10,
+        save_strategy="epoch",
+        report_to="none",
         run_name=config.run_name,
         train_sampling_strategy="group_by_length",
         dataloader_num_workers=4,
         dataset_text_field="text",
         max_length=config.max_seq_len,
     )
-    trainer = SFTTrainer(model=model, processing_class=tokenizer, train_dataset=dataset, args=args)
+    trainer = SFTTrainer(
+        model=model, processing_class=tokenizer, train_dataset=dataset, args=args
+    )
 
     console.print("[cyan]Training started...[/cyan]")
     try:
@@ -165,6 +181,7 @@ def train(config: TrainConfig) -> Path:
 
 def _warn_if_merge_wont_fit(hf_config: Any, base_model: str) -> None:
     from aft.recommend import detect_system_ram_mib
+
     num_params = getattr(hf_config, "num_parameters", None)
     if not num_params:
         return
@@ -172,24 +189,53 @@ def _warn_if_merge_wont_fit(hf_config: Any, base_model: str) -> None:
     needed_gib = checkpoint_size_gib(num_params, dtype_bytes(dtype))
     ram_mib = detect_system_ram_mib()
     if ram_mib is None:
-        logger.warning("Could not detect system RAM; cannot assess merge feasibility for {} (needs ≈{:.0f} GiB)", base_model, needed_gib)
+        logger.warning(
+            "Could not detect system RAM; cannot assess merge"
+            " feasibility for {} (needs ≈{:.0f} GiB)",
+            base_model,
+            needed_gib,
+        )
         return
     ram_gib = ram_mib / 1024
     if needed_gib > ram_gib * 0.8:
-        console.print(f"[yellow]⚠ {base_model} needs ≈{needed_gib:.0f} GiB of RAM to merge on CPU but only {ram_gib:.0f} GiB is available. Consider --base-model-only instead.[/yellow]")
+        console.print(
+            f"[yellow]⚠ {base_model} needs ≈{needed_gib:.0f} GiB of RAM to"
+            f" merge on CPU but only {ram_gib:.0f} GiB is available."
+            f" Consider --base-model-only instead.[/yellow]"
+        )
 
 
-def merge_adapter(base_model: str, adapter_path: Path, output: Path, *, trust_remote_code: bool = False, revision: str | None = None) -> Path:
+def merge_adapter(
+    base_model: str,
+    adapter_path: Path,
+    output: Path,
+    *,
+    trust_remote_code: bool = False,
+    revision: str | None = None,
+) -> Path:
     """Merge LoRA adapter into the base model as safetensors."""
     from peft import PeftModel
+
     hf_token = _hf_token()
     output.mkdir(parents=True, exist_ok=True)
     console.print(f"[cyan]Loading base model on CPU for merge: {base_model}[/cyan]")
-    hf_config, multimodal, processor, _ = load_model_inputs(base_model, trust_remote_code=trust_remote_code, token=hf_token, revision=revision)
+    hf_config, multimodal, processor, _ = load_model_inputs(
+        base_model,
+        trust_remote_code=trust_remote_code,
+        token=hf_token,
+        revision=revision,
+    )
     _warn_if_merge_wont_fit(hf_config, base_model)
     model_dtype = resolve_dtype(hf_config)
     auto_cls = auto_model_class(hf_config)
-    model = auto_cls.from_pretrained(base_model, dtype=model_dtype, device_map="cpu", trust_remote_code=trust_remote_code, token=hf_token, revision=revision)
+    model = auto_cls.from_pretrained(
+        base_model,
+        dtype=model_dtype,
+        device_map="cpu",
+        trust_remote_code=trust_remote_code,
+        token=hf_token,
+        revision=revision,
+    )
     console.print("[cyan]Merging LoRA weights...[/cyan]")
     try:
         model = PeftModel.from_pretrained(model, str(adapter_path))
@@ -203,7 +249,9 @@ def merge_adapter(base_model: str, adapter_path: Path, output: Path, *, trust_re
     return output
 
 
-def quantize(model_path: Path, output: Path, config: QuantizeConfig, *, token: str | None = None) -> Path:
+def quantize(
+    model_path: Path, output: Path, config: QuantizeConfig, *, token: str | None = None
+) -> Path:
     """Quantize a merged model using GPTQModel."""
     silence_noisy_loggers()
     is_fp8, quant_label, vllm_quant_arg = validate_quant_config(config)
@@ -213,13 +261,18 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig, *, token: s
             os.chdir(tmp_dir)
             hf_token = token or _hf_token()
             output.mkdir(parents=True, exist_ok=True)
-            model, processor, _hf_config, calibration = load_model_for_quantization(model_path, config, is_fp8=is_fp8, hf_token=hf_token)
+            model, processor, _hf_config, calibration = load_model_for_quantization(
+                model_path, config, is_fp8=is_fp8, hf_token=hf_token
+            )
             materialize_meta_params(model, model_path)
             gptq_model = getattr(model, "gptq_model", None)
             if gptq_model is not None:
                 gptq_model.layer_modules_strict = False
             else:
-                logger.warning("Model has no gptq_model attribute; cannot relax layer_modules_strict.")
+                logger.warning(
+                    "Model has no gptq_model attribute;"
+                    " cannot relax layer_modules_strict."
+                )
             extra_info = f"(group_size={config.group_size})" if not is_fp8 else ""
             console.print(f"[cyan]Quantizing → {quant_label} {extra_info}...[/cyan]")
             try:
@@ -227,21 +280,42 @@ def quantize(model_path: Path, output: Path, config: QuantizeConfig, *, token: s
             except Exception as e:
                 raise AftError(f"{quant_label} quantization failed.") from e
             report_layer_coverage(model, strict=config.strict_layer_coverage)
-            save_quantized_artifact(model, processor, output, model_path, config, quant_label=quant_label, vllm_quant_arg=vllm_quant_arg, n_calibration_samples=len(calibration))
+            save_quantized_artifact(
+                model,
+                processor,
+                output,
+                model_path,
+                config,
+                quant_label=quant_label,
+                vllm_quant_arg=vllm_quant_arg,
+                n_calibration_samples=len(calibration),
+            )
             return output
     finally:
         os.chdir(prev_cwd)
 
 
-def push_to_hub(model_path: Path, repo_id: str, private: bool = False, token: str | None = None, commit_message: str = "Upload quantized model") -> str:
+def push_to_hub(
+    model_path: Path,
+    repo_id: str,
+    private: bool = False,
+    token: str | None = None,
+    commit_message: str = "Upload quantized model",
+) -> str:
     """Push a quantized model directory to HuggingFace Hub."""
     from huggingface_hub import HfApi
+
     resolved_token = token or _hf_token()
     api = HfApi(token=resolved_token)
     console.print(f"[cyan]Creating/verifying repo: {repo_id}[/cyan]")
     api.create_repo(repo_id=repo_id, private=private, exist_ok=True, repo_type="model")
     console.print(f"[cyan]Uploading {model_path} → {repo_id}...[/cyan]")
-    api.upload_folder(folder_path=str(model_path), repo_id=repo_id, repo_type="model", commit_message=commit_message)
+    api.upload_folder(
+        folder_path=str(model_path),
+        repo_id=repo_id,
+        repo_type="model",
+        commit_message=commit_message,
+    )
     url = f"https://huggingface.co/{repo_id}"
     console.print(f"[bold green]✓ Published → {url}[/bold green]")
     return url

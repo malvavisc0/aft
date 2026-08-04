@@ -22,7 +22,7 @@ def detect_system_ram_mib() -> int | None:
                 if line.startswith("MemTotal:"):
                     kb = int(line.split()[1])
                     return kb // 1024
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError, ValueError:
         pass
     return None
 
@@ -46,9 +46,7 @@ def checkpoint_size_gib(params: float, dtype_bytes: int) -> float:
     return params * dtype_bytes / 1024**3
 
 
-def _config_get(
-    config: dict[str, Any], key: str, default: Any = None
-) -> Any:
+def _config_get(config: dict[str, Any], key: str, default: Any = None) -> Any:
     """Read ``key`` from a HF config, falling back to a nested ``text_config``.
 
     Multimodal models (e.g. ``*ForConditionalGeneration``) put the language
@@ -91,9 +89,7 @@ def fetch_model_info(repo_id: str, token: str | None = None) -> ModelInfo:
     # Preserve first-seen order while de-duplicating.
     layer_types = list(dict.fromkeys(raw_layer_types))
 
-    dtype_name = _config_get(config, "dtype") or _config_get(
-        config, "torch_dtype"
-    )
+    dtype_name = _config_get(config, "dtype") or _config_get(config, "torch_dtype")
     dtype_bytes = _DTYPE_BYTES.get(str(dtype_name), 2)
 
     if params_b == 0.0:
@@ -162,14 +158,10 @@ def recommend(
     vram_gib = vram_mib / 1024
     ram_gib = ram_mib / 1024 if ram_mib is not None else 0
 
-    reasoning.append(
-        f"Model ~{params_b:.1f}B params on {vram_gib:.1f} GiB VRAM"
-    )
+    reasoning.append(f"Model ~{params_b:.1f}B params on {vram_gib:.1f} GiB VRAM")
 
     # ── Architecture warnings ──────────────────────────────────────────
-    checkpoint_gib = checkpoint_size_gib(
-        params_b * 1e9, model_info.dtype_bytes
-    )
+    checkpoint_gib = checkpoint_size_gib(params_b * 1e9, model_info.dtype_bytes)
     reasoning.append(
         f"Checkpoint ≈ {checkpoint_gib:.0f} GiB"
         f" ({model_info.dtype_bytes} bytes/param);"
@@ -177,8 +169,7 @@ def recommend(
     )
     if ram_mib is None:
         reasoning.append(
-            "⚠ Could not detect system RAM — merge feasibility"
-            " cannot be assessed"
+            "⚠ Could not detect system RAM — merge feasibility cannot be assessed"
         )
     elif checkpoint_gib > ram_gib:
         reasoning.append(
@@ -199,8 +190,7 @@ def recommend(
             f" targets"
         )
     if any(
-        arch.endswith("ForConditionalGeneration")
-        for arch in model_info.architectures
+        arch.endswith("ForConditionalGeneration") for arch in model_info.architectures
     ):
         reasoning.append(
             "⚠ Multimodal architecture — requires a processor-aware"
@@ -222,9 +212,7 @@ def recommend(
         lora_rank, lr, epochs, label = _TIERS[-1][1:]
 
     epoch_word = "epoch" if epochs == 1 else "epochs"
-    reasoning.append(
-        f"{label} → rank {lora_rank}, lr {lr}, {epochs} {epoch_word}"
-    )
+    reasoning.append(f"{label} → rank {lora_rank}, lr {lr}, {epochs} {epoch_word}")
 
     lora_alpha = lora_rank * LORA_ALPHA_MULTIPLIER
 
@@ -232,9 +220,7 @@ def recommend(
     base_weights_gib = params_b * 0.55
     overhead_gib = 2.0
 
-    reasoning.append(
-        f"QLoRA 4-bit base weights ≈ {base_weights_gib:.1f} GiB"
-    )
+    reasoning.append(f"QLoRA 4-bit base weights ≈ {base_weights_gib:.1f} GiB")
 
     # ── Seq len + batch size tuning ────────────────────────────────────
     available_gib = vram_gib * 0.85
