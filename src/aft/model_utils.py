@@ -416,26 +416,52 @@ def _install_meta_tensor(
 def _recompute_rope_buffers(model: torch.nn.Module) -> int:
     """Recompute rotary-embedding ``inv_freq`` buffers left on the meta device.
 
-    These are never stored in checkpoints — every HF ``RotaryEmbedding``
-    computes them at ``__init__`` via ``self.rope_init_fn(config, device)``.
-    Loaders that construct the model lazily/on the meta device skip that
-    computation, so recompute it directly instead of pretending it's a
-    missing checkpoint weight.
+    These are never stored in checkpoints — every HF rotary embedding module
+    computes them at ``__init__``, but loaders that construct the model
+    lazily/on the meta device skip that computation. Two shapes exist across
+    HF architectures:
+
+    * Text/"config-driven" rotary modules (``self.config``, ``self.rope_type``):
+      ``inv_freq`` comes from ``ROPE_INIT_FUNCTIONS[rope_type](config, device)``,
+      or ``compute_default_rope_parameters`` for ``rope_type == "default"``.
+    * Standalone vision rotary modules (``self.dim``, ``self.theta``, no
+      config): ``inv_freq = 1 / theta ** (arange(0, dim, 2) / dim)``.
     """
     fixed = 0
     for name, module in model.named_modules():
         buf = getattr(module, "inv_freq", None)
         if buf is None or not buf.is_meta:
             continue
-        rope_init_fn = getattr(module, "rope_init_fn", None)
+
         config = getattr(module, "config", None)
-        if rope_init_fn is None or config is None:
+        if config is not None:
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            rope_params = getattr(config, "rope_parameters", {})
+            rope_type = rope_params.get("rope_type", "default")
+            rope_init_fn = (
+                module.compute_default_rope_parameters
+                if rope_type == "default"
+                else ROPE_INIT_FUNCTIONS[rope_type]
+            )
+            inv_freq, attention_scaling = rope_init_fn(config, torch.device("cpu"))
+            module.attention_scaling = attention_scaling
+        elif hasattr(module, "dim") and hasattr(module, "theta"):
+            dim, theta = module.dim, module.theta
+            inv_freq = 1.0 / (
+                theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim)
+            )
+        else:
             raise AftError(
                 f"'{name}.inv_freq' is on the meta device and this module has"
-                " no rope_init_fn/config to recompute it from."
+                " neither config/rope_type nor dim/theta to recompute it from."
             )
-        inv_freq, _attention_scaling = rope_init_fn(config, torch.device("cpu"))
+
         module.register_buffer("inv_freq", inv_freq, persistent=False)
+        if hasattr(module, "original_inv_freq"):
+            module.register_buffer(
+                "original_inv_freq", inv_freq.clone(), persistent=False
+            )
         fixed += 1
     return fixed
 
