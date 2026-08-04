@@ -55,12 +55,19 @@ class TestQuantizeConfigDefaults:
     def test_defaults(self) -> None:
         cfg = QuantizeConfig()
         assert cfg.bits == 4
-        assert cfg.group_size == 32
+        # 128 is the group size vLLM's gptq_marlin kernel expects.
+        assert cfg.group_size == 128
         assert cfg.desc_act is False
         assert cfg.calibration_dataset == "fineweb-edu"
-        assert cfg.n_calibration_samples == 512
+        assert cfg.n_calibration_samples == 128
         assert cfg.calibration_seq_len == 2048
-        assert cfg.trust_remote_code is True
+        # Executing remote code must be opt-in, never the default.
+        assert cfg.trust_remote_code is False
+        assert cfg.revision is None
+        # Calibration should match serving-time formatting by default, and
+        # incomplete layer coverage should be an error rather than a warning.
+        assert cfg.use_chat_template is True
+        assert cfg.strict_layer_coverage is True
 
     def test_custom_values(self) -> None:
         cfg = QuantizeConfig(bits=8, trust_remote_code=True)

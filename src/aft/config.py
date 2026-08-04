@@ -2,6 +2,10 @@
 
 from dataclasses import dataclass, field
 
+#: Convention: LoRA alpha is 2× the rank. Centralised so CLI, recommendation,
+#: and config all agree on the same multiplier.
+LORA_ALPHA_MULTIPLIER: int = 2
+
 
 @dataclass
 class TrainConfig:
@@ -34,6 +38,10 @@ class TrainConfig:
     languages: list[str] | None = None
     max_special_ratio: float = 0.3
     trust_remote_code: bool = False
+    revision: str | None = None
+    #: Explicit LoRA target module names. When ``None`` the modules are
+    #: discovered from the loaded model instead of being hard-coded.
+    target_modules: list[str] | None = None
 
 
 @dataclass
@@ -41,13 +49,19 @@ class QuantizeConfig:
     """GPTQ / FP8 quantization phase configuration."""
 
     bits: int = 4
-    group_size: int = 32
+    #: 128 is what vLLM's ``gptq_marlin`` kernel expects (or -1 per-column).
+    group_size: int = 128
     desc_act: bool = False
     format: str = "gptq"  # "gptq" | "fp8"
     calibration_dataset: str = "fineweb-edu"
-    n_calibration_samples: int = 512
+    n_calibration_samples: int = 128
     calibration_seq_len: int = 2048
-    trust_remote_code: bool = True
+    trust_remote_code: bool = False
+    revision: str | None = None
+    #: Apply the model's chat template to calibration texts when available.
+    use_chat_template: bool = True
+    #: Fail if any quantizable layer is unexpectedly skipped by GPTQModel.
+    strict_layer_coverage: bool = True
 
 
 @dataclass
@@ -60,6 +74,14 @@ class ModelInfo:
     architectures: list[str]
     hidden_size: int | None = None
     num_layers: int | None = None
+    #: Distinct values from ``layer_types`` (hybrid attention models).
+    layer_types: list[str] = field(default_factory=list)
+    #: Number of MoE experts, when the model is sparse.
+    num_experts: int | None = None
+    #: Bytes per parameter of the checkpoint dtype (for size estimates).
+    dtype_bytes: int = 2
+    #: Resolved commit SHA of the fetched revision.
+    revision: str | None = None
 
 
 @dataclass

@@ -129,12 +129,15 @@ aft run \
 | `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
 | `--gptq-group-size` | `128` | GPTQ group size (int4/int8 only) |
 | `--calibration` | `fineweb-edu` | Calibration dataset (`fineweb-edu` or path to JSONL) |
+| `--target-modules` | auto-detected | Comma-separated LoRA target modules. Discovered from the model when omitted |
+| `--revision` | latest | Pin the base model to a specific git revision |
 
 #### Pipeline control
 
 | Flag | Description |
 |------|-------------|
 | `--skip-finetune` | Skip SFT, merge + quantize an existing adapter |
+| `--no-finetune` | Quantize the base model directly — no SFT, no adapter, no merge |
 | `--skip-quantize` | Stop after merge (produces fp16 model) |
 | `--resume` | Auto-detect completed phases and skip them |
 
@@ -164,8 +167,11 @@ aft quantize \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
-| `--group-size` | `128` | GPTQ group size (int4/int8 only) |
+| `--group-size` | `128` | GPTQ group size (int4/int8 only). Must be 128, 64, 32, or -1 |
 | `--desc-act` | off | Use activation order — slower, better quality (int4/int8 only) |
+| `--no-chat-template` | off | Calibrate on raw text instead of the model's chat template |
+| `--allow-partial-coverage` | off | Permit layers to be left unquantized instead of failing |
+| `--revision` | latest | Pin the model to a specific git revision |
 | `--calibration` | `fineweb-edu` | Calibration dataset |
 | `--n-calibration-samples` | `128` | Number of calibration samples |
 | `--calibration-seq-len` | `2048` | Calibration sequence length |
@@ -207,14 +213,32 @@ aft run --dataset teknium/OpenHermes-2.5,Open-Orca/SlimOrca --model ... --run-na
 
 ## Supported Architectures
 
-LoRA adapters target `q_proj`, `k_proj`, `v_proj`, `o_proj` (attention) and `gate_proj`, `up_proj`, `down_proj` (MLP). This covers models that use these layer names, including:
+LoRA target modules are **discovered from the loaded model**, by intersecting its
+actual linear layers with a set of known projection names (`q/k/v/o_proj`,
+`qkv_proj`, `gate/up/down_proj`, `gate_up_proj`, `in_proj`, `out_proj`). Well
+tested on:
 
 - **Llama** family (Llama 2, Llama 3, Code Llama)
 - **Qwen** family (Qwen 2, Qwen 2.5)
 - **Mistral** / Mixtral
 - **Gemma** / Gemma 2
 
-Models with different layer names (e.g. Mamba, RWKV) will not match these targets and are not currently supported without changes.
+If no candidate names match, `aft` **fails with an explicit error** rather than
+training an adapter that touches almost nothing. Use `--target-modules` to name
+the layers yourself for unusual architectures.
+
+**Multimodal models** (`*ForConditionalGeneration`) are loaded with
+`AutoModelForImageTextToText` + `AutoProcessor`, and their
+`preprocessor_config.json` / `processor_config.json` / `chat_template.jinja`
+are carried into every output directory. Note that calibration is text-only, so
+the vision tower's activation statistics are not represented — `aft` warns when
+this applies.
+
+**Hybrid / MoE architectures** (linear attention, SSM blocks, sparse experts)
+often contain modules GPTQModel does not recognise. Those layers would otherwise
+be silently left in full precision, so after quantizing `aft` reports layer
+coverage and **fails** if any quantizable linear was skipped. Pass
+`--allow-partial-coverage` if that is genuinely intended.
 
 ## Serving with vLLM
 
@@ -342,7 +366,14 @@ GPTQ was chosen because:
 
 ### Why these LoRA target modules?
 
-The adapter targets `q_proj`, `k_proj`, `v_proj`, `o_proj` (attention) plus `gate_proj`, `up_proj`, `down_proj` (MLP). This covers both the attention and feed-forward layers, which is more comprehensive than attention-only targeting. The MLP layers often carry domain-specific knowledge, making them important for instruction-following fine-tuning.
+The adapter targets attention projections (`q/k/v/o_proj`) plus the feed-forward
+projections (`gate/up/down_proj`). Covering both is more comprehensive than
+attention-only targeting: the MLP layers often carry domain-specific knowledge,
+making them important for instruction-following fine-tuning.
+
+These names are treated as *candidates*, not assumptions — the final list is the
+intersection with the modules the loaded model actually has, so a wrong guess
+surfaces as an error instead of a quietly ineffective training run.
 
 ### Memory estimation
 
@@ -356,7 +387,9 @@ The `0.55` factor accounts for the NF4 quantization (4 bits/param) plus safetens
 
 ## Known Limitations
 
-- **Hard-coded target modules** — LoRA targets `q/k/v/o_proj + gate/up/down_proj`, which covers Llama and Qwen-style architectures. Models with different layer names (e.g. Mamba, RWKV) will need manual `target_modules` configuration.
+- **Merging requires the whole model in RAM** — `merge_adapter` materializes the full unquantized model on CPU, so a 35B/65 GiB checkpoint needs ≥65 GiB of system RAM. `aft` warns when the checkpoint clearly won't fit; for large models use `--no-finetune` to quantize the base model directly.
+- **No layer-sequential or CPU-offload quantization** — quantization assumes the model can be loaded on the available hardware.
+- **Text-only calibration** — even for multimodal models; the vision path is not calibrated.
 - **Single-GPU training only** — No FSDP or DeepSpeed support. Multi-GPU is limited to data-parallel via `device_map="auto"`.
 - **No eval/validation during training** — Training runs without a validation set. Metrics are training loss only.
 - **No early stopping** — The pipeline trains for the specified number of epochs without monitoring validation loss.

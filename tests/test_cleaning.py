@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from aft.cleaning import clean_dataset
+import pytest
+
+from aft.cleaning import AftError, clean_dataset
 from tests.conftest import FakeDataset, FakeTokenizer, make_fake_dataset
 
 
@@ -130,8 +132,9 @@ class TestDeduplication:
 
 
 class TestLanguageFilter:
-    def test_language_filter_skipped_when_not_installed(self) -> None:
-        """When langdetect is not installed, filter is skipped with warning."""
+    def test_language_filter_raises_when_not_installed(self) -> None:
+        """When langdetect is not installed, requesting language filtering
+        should raise, not silently skip the filter."""
         import builtins
 
         ds = make_fake_dataset(["hello world test data"])
@@ -144,9 +147,8 @@ class TestLanguageFilter:
             return real_import(name, *args, **kwargs)  # type: ignore[no-any-return]
 
         with patch.object(builtins, "__import__", side_effect=mock_import):
-            result = clean_dataset(ds, tokenizer, languages=["en"], min_tokens=1)
-        # Should not crash; filter skipped, all samples kept
-        assert len(result) == 1
+            with pytest.raises(AftError, match="langdetect"):
+                clean_dataset(ds, tokenizer, languages=["en"], min_tokens=1)
 
 
 class TestCleanDatasetEdgeCases:

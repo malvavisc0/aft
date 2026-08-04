@@ -6,6 +6,9 @@ import re
 from loguru import logger
 
 from aft.ui import console
+from aft.errors import AftError
+
+
 
 
 def clean_dataset(
@@ -67,7 +70,9 @@ def clean_dataset(
     # ── 3. Token length filter ─────────────────────────────────────────
     def _token_length_ok(example: dict) -> bool:
         ids = tokenizer(example["text"], return_length=True)
-        length = ids["length"][0] if isinstance(ids["length"], list) else ids["length"]
+        # ``ids["length"]`` may be a list, numpy array, or tensor depending
+        # on the tokenizer backend. Coerce via int() to handle all cases.
+        length = int(ids["length"][0])
         return min_tokens <= length <= max_tokens
 
     n_before = len(dataset)
@@ -84,24 +89,31 @@ def clean_dataset(
     if languages:
         try:
             from langdetect import detect as detect_lang
-
-            def _lang_ok(example: dict) -> bool:
-                try:
-                    return detect_lang(example["text"]) in languages
-                except Exception:
-                    return False
-
-            n_before = len(dataset)
-            dataset = dataset.filter(_lang_ok)
-            if len(dataset) != n_before:
-                logger.debug(
-                    "Cleaning: dropped {} non-{} samples",
-                    n_before - len(dataset),
-                    ",".join(languages),
-                )
+            from langdetect.lang_detect_exception import (
+                LangDetectException,
+            )
         except ImportError:
-            console.print(
-                "[yellow]⚠ langdetect not installed — skipping language filter[/yellow]"
+            raise AftError(
+                "Language filtering requested (--languages) but"
+                " `langdetect` is not installed.\n"
+                "  Install it with: pip install langdetect\n"
+                "  Or remove --languages to skip language filtering."
+            ) from None
+
+        def _lang_ok(example: dict) -> bool:
+            try:
+                return detect_lang(example["text"]) in languages
+            except LangDetectException:
+                # "Can't detect language" — drop the sample.
+                return False
+
+        n_before = len(dataset)
+        dataset = dataset.filter(_lang_ok)
+        if len(dataset) != n_before:
+            logger.debug(
+                "Cleaning: dropped {} non-{} samples",
+                n_before - len(dataset),
+                ",".join(languages),
             )
 
     # ── 5. Deduplication ──────────────────────────────────────────────

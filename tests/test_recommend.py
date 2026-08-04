@@ -25,7 +25,7 @@ class TestDetectSystemRam:
     def test_file_not_found(self) -> None:
         with patch("builtins.open", side_effect=FileNotFoundError):
             ram = detect_system_ram_mib()
-        assert ram == 0
+        assert ram is None
 
     def test_invalid_content(self) -> None:
         fake_content = "MemTotal:       not-a-number kB\n"
@@ -34,7 +34,7 @@ class TestDetectSystemRam:
         mock_file.__exit__ = MagicMock(return_value=False)
         with patch("builtins.open", return_value=mock_file):
             ram = detect_system_ram_mib()
-        assert ram == 0
+        assert ram is None
 
 
 # ── fetch_model_info ───────────────────────────────────────────────────────

@@ -1,47 +1,115 @@
 """Hardware detection and QLoRA parameter recommendation."""
 
+import math
 import re
+from typing import Any
 
-from aft.config import ModelInfo, Recommendation
+from loguru import logger
+
+from aft.config import LORA_ALPHA_MULTIPLIER, ModelInfo, Recommendation
 
 
-def detect_system_ram_mib() -> int:
-    """Detect total system RAM in MiB from /proc/meminfo."""
+def detect_system_ram_mib() -> int | None:
+    """Detect total system RAM in MiB from /proc/meminfo.
+
+    Returns ``None`` when detection fails (non-Linux, permissions, corrupt
+    content). Callers must handle ``None`` explicitly — returning ``0`` would
+    silently disable RAM-based feasibility checks.
+    """
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemTotal:"):
                     kb = int(line.split()[1])
                     return kb // 1024
-    except FileNotFoundError, ValueError:
+    except (FileNotFoundError, ValueError):
         pass
-    return 0
+    return None
+
+
+#: Bytes per parameter for the dtype names HF reports in ``config.dtype``.
+_DTYPE_BYTES: dict[str, int] = {
+    "float32": 4,
+    "float16": 2,
+    "bfloat16": 2,
+    "float8_e4m3fn": 1,
+    "int8": 1,
+}
+
+
+def checkpoint_size_gib(params: float, dtype_bytes: int) -> float:
+    """Estimate checkpoint size in GiB from parameter count and dtype.
+
+    Shared by :func:`recommend` and
+    :func:`aft.pipeline._warn_if_merge_wont_fit` so both use the same math.
+    """
+    return params * dtype_bytes / 1024**3
+
+
+def _config_get(
+    config: dict[str, Any], key: str, default: Any = None
+) -> Any:
+    """Read ``key`` from a HF config, falling back to a nested ``text_config``.
+
+    Multimodal models (e.g. ``*ForConditionalGeneration``) put the language
+    model hyper-parameters under ``text_config`` rather than at the top level.
+    """
+    if not config:
+        return default
+    if key in config and config[key] is not None:
+        return config[key]
+    text_config = config.get("text_config") or {}
+    value = text_config.get(key)
+    return value if value is not None else default
 
 
 def fetch_model_info(repo_id: str, token: str | None = None) -> ModelInfo:
     """Fetch model metadata from HuggingFace Hub.
 
-    Uses the HF API to retrieve parameter count and architecture info.
+    Uses the HF API to retrieve parameter count and architecture info,
+    including hybrid ``layer_types`` and MoE expert counts, both of which
+    determine whether this pipeline can handle the model at all.
     """
     from huggingface_hub import HfApi
 
     api = HfApi(token=token)
     info = api.model_info(repo_id)
 
+    # ``safetensors.total`` is a *parameter count*, not a byte count.
     params_b = 0.0
     if info.safetensors and info.safetensors.total:
         params_b = info.safetensors.total / 1e9
 
-    architectures = info.config.get("architectures", []) if info.config else []
-    model_type = info.config.get("model_type", "unknown") if info.config else "unknown"
-    hidden_size = info.config.get("hidden_size") if info.config else None
-    num_layers = info.config.get("num_hidden_layers") if info.config else None
+    config = info.config or {}
+    architectures = config.get("architectures", [])
+    model_type = config.get("model_type", "unknown")
+    hidden_size = _config_get(config, "hidden_size")
+    num_layers = _config_get(config, "num_hidden_layers")
+    num_experts = _config_get(config, "num_experts")
+
+    raw_layer_types = _config_get(config, "layer_types") or []
+    # Preserve first-seen order while de-duplicating.
+    layer_types = list(dict.fromkeys(raw_layer_types))
+
+    dtype_name = _config_get(config, "dtype") or _config_get(
+        config, "torch_dtype"
+    )
+    dtype_bytes = _DTYPE_BYTES.get(str(dtype_name), 2)
 
     if params_b == 0.0:
-        # Fallback: parse size from repo name (e.g. "9B", "7b", "70B")
+        # Fallback: parse size from repo name (e.g. "9B", "7b", "70B").
+        # This is a guess — warn so the user knows the count is not from
+        # safetensors metadata and may be wrong (e.g. "2Bit-7B" → "2B").
         match = re.search(r"(\d+(?:\.\d+)?)[Bb]", repo_id)
         if match:
             params_b = float(match.group(1))
+            logger.warning(
+                "Parameter count not in safetensors metadata;"
+                " guessed {:.1f}B from repo name '{}' — this may be"
+                " inaccurate",
+                params_b,
+                repo_id,
+            )
 
     return ModelInfo(
         repo_id=repo_id,
@@ -50,13 +118,29 @@ def fetch_model_info(repo_id: str, token: str | None = None) -> ModelInfo:
         architectures=architectures,
         hidden_size=hidden_size,
         num_layers=num_layers,
+        layer_types=layer_types,
+        num_experts=num_experts,
+        dtype_bytes=dtype_bytes,
+        revision=getattr(info, "sha", None),
     )
+
+
+#: Data-driven size tiers: (max_params_b, lora_rank, lr, epochs, label).
+#: Replaces a long if/elif chain that repeated the same assign+reasoning
+#: pattern in every branch.
+_TIERS: list[tuple[float, int, float, int, str]] = [
+    (3, 8, 2e-4, 3, "Small model (<3B)"),
+    (8, 16, 2e-4, 2, "Medium model (3-8B)"),
+    (20, 32, 1e-4, 2, "Large model (8-20B)"),
+    (70, 64, 5e-5, 1, "Very large model (20-70B)"),
+    (math.inf, 64, 2e-5, 1, "Massive model (>70B)"),
+]
 
 
 def recommend(
     model_info: ModelInfo,
     vram_mib: int,
-    ram_mib: int,
+    ram_mib: int | None,
     bf16_supported: bool,
     gpu_vram_mib: list[int] | None = None,
 ) -> Recommendation:
@@ -65,7 +149,7 @@ def recommend(
     Args:
         model_info: Model metadata from :func:`fetch_model_info`.
         vram_mib: Total GPU VRAM in MiB.
-        ram_mib: Total system RAM in MiB.
+        ram_mib: Total system RAM in MiB, or ``None`` if undetectable.
         bf16_supported: Whether the GPU supports BF16.
         gpu_vram_mib: Per-GPU VRAM list in MiB. When provided,
             ``max_memory`` will set per-device limits for each GPU.
@@ -76,9 +160,53 @@ def recommend(
     reasoning: list[str] = []
     params_b = model_info.params_b
     vram_gib = vram_mib / 1024
-    ram_gib = ram_mib / 1024
+    ram_gib = ram_mib / 1024 if ram_mib is not None else 0
 
-    reasoning.append(f"Model ~{params_b:.1f}B params on {vram_gib:.1f} GiB VRAM")
+    reasoning.append(
+        f"Model ~{params_b:.1f}B params on {vram_gib:.1f} GiB VRAM"
+    )
+
+    # ── Architecture warnings ──────────────────────────────────────────
+    checkpoint_gib = checkpoint_size_gib(
+        params_b * 1e9, model_info.dtype_bytes
+    )
+    reasoning.append(
+        f"Checkpoint ≈ {checkpoint_gib:.0f} GiB"
+        f" ({model_info.dtype_bytes} bytes/param);"
+        f" a CPU-side merge needs at least that much system RAM"
+    )
+    if ram_mib is None:
+        reasoning.append(
+            "⚠ Could not detect system RAM — merge feasibility"
+            " cannot be assessed"
+        )
+    elif checkpoint_gib > ram_gib:
+        reasoning.append(
+            f"⚠ Checkpoint ({checkpoint_gib:.0f} GiB) exceeds system RAM"
+            f" ({ram_gib:.0f} GiB) — the merge phase will not fit"
+        )
+    if model_info.num_experts:
+        reasoning.append(
+            f"⚠ Sparse MoE ({model_info.num_experts} experts):"
+            f" total-parameter heuristics below are unreliable, and expert"
+            f" layers must be verified as quantized"
+        )
+    if len(model_info.layer_types) > 1:
+        reasoning.append(
+            f"⚠ Hybrid attention (layer_types: "
+            f"{', '.join(model_info.layer_types)}):"
+            f" non-Linear modules will not match the default LoRA/GPTQ"
+            f" targets"
+        )
+    if any(
+        arch.endswith("ForConditionalGeneration")
+        for arch in model_info.architectures
+    ):
+        reasoning.append(
+            "⚠ Multimodal architecture — requires a processor-aware"
+            " loader, not AutoModelForCausalLM"
+        )
+
     if gpu_vram_mib and len(gpu_vram_mib) > 1:
         reasoning.append(
             f"Multi-GPU: {len(gpu_vram_mib)} GPUs"
@@ -86,40 +214,27 @@ def recommend(
             f" → model shards via device_map='auto'"
         )
 
-    # ── Size-based LoRA + LR heuristics ────────────────────────────────
-    if params_b < 3:
-        lora_rank, lr, epochs = 8, 2e-4, 3
-        reasoning.append(
-            f"Small model (<3B) → rank {lora_rank}, lr {lr}, {epochs} epochs"
-        )
-    elif params_b < 8:
-        lora_rank, lr, epochs = 16, 2e-4, 2
-        reasoning.append(
-            f"Medium model (3-8B) → rank {lora_rank}, lr {lr}, {epochs} epochs"
-        )
-    elif params_b < 20:
-        lora_rank, lr, epochs = 32, 1e-4, 2
-        reasoning.append(
-            f"Large model (8-20B) → rank {lora_rank}, lr {lr}, {epochs} epochs"
-        )
-    elif params_b < 70:
-        lora_rank, lr, epochs = 64, 5e-5, 1
-        reasoning.append(
-            f"Very large model (20-70B) → rank {lora_rank}, lr {lr}, {epochs} epoch"
-        )
-    else:
-        lora_rank, lr, epochs = 64, 2e-5, 1
-        reasoning.append(
-            f"Massive model (>70B) → rank {lora_rank}, lr {lr}, {epochs} epoch"
-        )
+    # ── Size-based LoRA + LR heuristics (data-driven) ──────────────────
+    for max_params, lora_rank, lr, epochs, label in _TIERS:
+        if params_b < max_params:
+            break
+    else:  # pragma: no cover - _TIERS ends with inf
+        lora_rank, lr, epochs, label = _TIERS[-1][1:]
 
-    lora_alpha = lora_rank * 2
+    epoch_word = "epoch" if epochs == 1 else "epochs"
+    reasoning.append(
+        f"{label} → rank {lora_rank}, lr {lr}, {epochs} {epoch_word}"
+    )
+
+    lora_alpha = lora_rank * LORA_ALPHA_MULTIPLIER
 
     # ── QLoRA 4-bit memory estimation ──────────────────────────────────
     base_weights_gib = params_b * 0.55
     overhead_gib = 2.0
 
-    reasoning.append(f"QLoRA 4-bit base weights ≈ {base_weights_gib:.1f} GiB")
+    reasoning.append(
+        f"QLoRA 4-bit base weights ≈ {base_weights_gib:.1f} GiB"
+    )
 
     # ── Seq len + batch size tuning ────────────────────────────────────
     available_gib = vram_gib * 0.85

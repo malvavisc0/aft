@@ -2,6 +2,7 @@
 
 import platform
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich import box
@@ -10,6 +11,9 @@ from rich.table import Table
 from typing_extensions import Annotated
 
 from aft.ui import console
+
+if TYPE_CHECKING:
+    from aft.config import QuantizeConfig
 
 app = typer.Typer(
     name="aft",
@@ -33,6 +37,122 @@ def _banner() -> None:
         " [dim]→[/dim] [bold magenta]GPTQ quantization[/bold magenta]"
     )
     console.print()
+
+
+#: Maps `--quant-type` to (bits, format, label, output subdirectory).
+_QUANT_TYPES: dict[str, tuple[int, str, str, str]] = {
+    "int4": (4, "gptq", "GPTQ Int4", "gptq-int4"),
+    "int8": (8, "gptq", "GPTQ Int8", "gptq-int8"),
+    "fp8": (8, "fp8", "FP8", "fp8"),
+}
+
+
+def _build_quant_config(
+    *,
+    bits: int,
+    format: str,
+    group_size: int,
+    calibration_dataset: str,
+    trust_remote_code: bool,
+    revision: str | None,
+    desc_act: bool = False,
+    n_calibration_samples: int = 128,
+    calibration_seq_len: int = 2048,
+    use_chat_template: bool = True,
+    strict_layer_coverage: bool = True,
+) -> "QuantizeConfig":
+    """Map CLI args to a QuantizeConfig (shared by run_cmd and quantize_cmd)."""
+    from aft.config import QuantizeConfig
+
+    return QuantizeConfig(
+        bits=bits,
+        format=format,
+        group_size=group_size,
+        desc_act=desc_act,
+        calibration_dataset=calibration_dataset,
+        n_calibration_samples=n_calibration_samples,
+        calibration_seq_len=calibration_seq_len,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        use_chat_template=use_chat_template,
+        strict_layer_coverage=strict_layer_coverage,
+    )
+
+
+def _resolve_quant_type(quant_type: str) -> tuple[int, str, str, str]:
+    """Validate `--quant-type` instead of silently falling back to Int4."""
+    try:
+        return _QUANT_TYPES[quant_type.lower()]
+    except KeyError as exc:
+        console.print(
+            f"[red]Unknown --quant-type '{quant_type}'."
+            f" Valid options: {', '.join(_QUANT_TYPES)}[/red]"
+        )
+        raise typer.Exit(1) from exc
+
+
+def _verify_resume_compatibility(
+    quant_dir: Path,
+    model: str,
+    quant_cfg: object,
+    revision: str | None,
+) -> None:
+    """Refuse to resume into an output directory built from different inputs.
+
+    File existence alone says nothing about *what* produced those files.
+    `aft_provenance.json` (written by the quantize phase) lets us compare the
+    source model, revision, and quantization settings before reusing them.
+    """
+    import json
+
+    provenance_path = quant_dir / "aft_provenance.json"
+    if not provenance_path.is_file():
+        if quant_dir.exists() and any(quant_dir.glob("*.safetensors")):
+            console.print(
+                f"[yellow]⚠ Resume: {quant_dir} has weights but no"
+                f" aft_provenance.json, so it cannot be verified. It may have"
+                f" been produced with different settings.[/yellow]"
+            )
+        return
+
+    try:
+        prov = json.loads(provenance_path.read_text())
+    except json.JSONDecodeError:
+        console.print(f"[yellow]⚠ Resume: {provenance_path} is unreadable[/yellow]")
+        return
+
+    mismatches: list[str] = []
+    prev_quant = prov.get("quantization", {})
+    for label, previous, current in (
+        ("bits", prev_quant.get("bits"), getattr(quant_cfg, "bits", None)),
+        ("format", prev_quant.get("format"), getattr(quant_cfg, "format", None)),
+        (
+            "group_size",
+            prev_quant.get("group_size"),
+            getattr(quant_cfg, "group_size", None),
+        ),
+    ):
+        if previous is not None and previous != current:
+            mismatches.append(f"{label}: existing={previous}, requested={current}")
+
+    prev_revision = prov.get("source_revision")
+    if revision and prev_revision and prev_revision != revision:
+        mismatches.append(f"revision: existing={prev_revision}, requested={revision}")
+
+    if mismatches:
+        console.print(
+            "[red]✗ Refusing to resume: the existing artifact was built with"
+            " different settings.[/red]"
+        )
+        for mismatch in mismatches:
+            console.print(f"[red]    {mismatch}[/red]")
+        console.print(
+            f"[red]  Source model on disk: {prov.get('source_model')}[/red]\n"
+            f"[red]  Delete {quant_dir} or drop --resume to rebuild.[/red]"
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓ Resume: verified existing artifact in {quant_dir}[/green]")
 
 
 def _step_bar(active: int, steps: list[str]) -> None:
@@ -94,9 +214,14 @@ def recommend_cmd(
             )
     else:
         console.print("    [bold cyan]GPU[/bold cyan]  [red]None detected[/red]")
+
+    if total_ram_mib is not None:
+        ram_str = f"{total_ram_mib / 1024:.1f} GiB"
+    else:
+        ram_str = "[red]undetectable[/red]"
     bf16_str = "[green]✓[/green]" if bf16 else "[red]✗[/red]"
     console.print(
-        f"    [bold cyan]RAM[/bold cyan]  [green]{total_ram_mib / 1024:.1f} GiB[/green]"
+        f"    [bold cyan]RAM[/bold cyan]  [green]{ram_str}[/green]"
         f"  [bold cyan]BF16[/bold cyan] {bf16_str}"
         f"  [bold cyan]OS[/bold cyan]  [green]{platform.system()}[/green]"
     )
@@ -139,12 +264,27 @@ def recommend_cmd(
         console.print(f"    {'  '.join(parts)}")
     console.print()
 
+    # When no GPU is detected, use a hypothetical 24 GiB VRAM but make the
+    # assumption explicit to the user instead of burying it in an `or`.
+    if not gpus:
+        hypothetical_vram_mib = 24 * 1024
+        console.print(
+            f"[yellow]⚠ No GPU detected — computing a hypothetical"
+            f" recommendation assuming {hypothetical_vram_mib / 1024:.0f}"
+            f" GiB VRAM. Do not rely on these settings for actual"
+            f" training.[/yellow]"
+        )
+        console.print()
+        rec_vram_mib = hypothetical_vram_mib
+    else:
+        rec_vram_mib = total_vram_mib
+
     with console.status(
         "[bold cyan]Computing recommendations...[/bold cyan]", spinner="dots"
     ):
         rec = recommend(
             model_info=model_info,
-            vram_mib=total_vram_mib or 24 * 1024,
+            vram_mib=rec_vram_mib,
             ram_mib=total_ram_mib,
             bf16_supported=bf16,
             gpu_vram_mib=[g["vram_mib"] for g in gpus] or None,
@@ -248,41 +388,48 @@ def run_cmd(
             help="Quantization type: int4, int8, or fp8.",
         ),
     ] = "int4",
-    gptq_group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 32,
+    gptq_group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
     calibration: Annotated[
         str, typer.Option(help="'fineweb-edu' or path to JSONL.")
     ] = "fineweb-edu",
+    target_modules: Annotated[
+        str | None,
+        typer.Option(
+            "--target-modules",
+            help="Comma-separated LoRA target module names. Auto-detected"
+            " from the model when omitted.",
+        ),
+    ] = None,
+    revision: Annotated[
+        str | None,
+        typer.Option("--revision", help="Pin the base model to a git revision."),
+    ] = None,
     trust_remote_code: Annotated[
         bool, typer.Option(help="Allow loading models with custom code.")
+    ] = False,
+    base_model_only: Annotated[
+        bool,
+        typer.Option(
+            "--base-model-only",
+            help="Quantize the base model directly — no SFT, no adapter, no merge.",
+        ),
     ] = False,
     resume: Annotated[
         bool, typer.Option("--resume", help="Skip phases whose output exists.")
     ] = False,
 ) -> None:
     """Full pipeline: QLoRA SFT → merge LoRA → quantize."""
-    from aft.config import QuantizeConfig, TrainConfig
-    from aft.pipeline import AftError, merge_adapter, quantize, train
+    from aft.config import LORA_ALPHA_MULTIPLIER, TrainConfig
+    from aft.errors import AftError
+    from aft.pipeline import merge_adapter, quantize, train
 
     _banner()
 
-    # Derive bits and format from quant_type
-    if quant_type == "fp8":
-        q_bits = 8
-        q_format = "fp8"
-        q_label = "FP8"
-        q_dir_name = "fp8"
-    elif quant_type == "int8":
-        q_bits = 8
-        q_format = "gptq"
-        q_label = "GPTQ Int8"
-        q_dir_name = "gptq-int8"
-    else:
-        q_bits = 4
-        q_format = "gptq"
-        q_label = "GPTQ Int4"
-        q_dir_name = "gptq-int4"
+    q_bits, q_format, q_label, q_dir_name = _resolve_quant_type(quant_type)
 
     steps = ["QLoRA SFT", "Merge LoRA", q_label]
+    if base_model_only:
+        steps = [q_label]
 
     dataset_ids = [d.strip() for d in dataset.split(",") if d.strip()]
     lang_list = (
@@ -291,14 +438,47 @@ def run_cmd(
         else None
     )
 
+    target_module_list = (
+        [t.strip() for t in target_modules.split(",") if t.strip()]
+        if target_modules
+        else None
+    )
+
     base_dir = output / run_name
     adapter_dir = base_dir / "adapter"
     merged_dir = base_dir / "merged"
     gptq_dir = base_dir / q_dir_name
 
+    quant_cfg = _build_quant_config(
+        bits=q_bits,
+        format=q_format,
+        group_size=gptq_group_size,
+        calibration_dataset=calibration,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+    )
+
+    # ── Direct base-model quantization (no SFT, no merge) ──────────────
+    # The only viable route for models too large to train or merge locally.
+    if base_model_only:
+        console.print(
+            "[yellow]⚠ --base-model-only: quantizing the base model"
+            " directly, skipping SFT and merge.[/yellow]"
+        )
+        _step_bar(0, steps)
+        try:
+            quantize(Path(model), gptq_dir, quant_cfg)
+        except AftError as exc:
+            console.print(f"\n[red]✗ {exc}[/red]")
+            raise typer.Exit(1) from exc
+        _step_bar(len(steps), steps)
+        console.print(f"[bold green]✓ {q_label} → {gptq_dir}[/bold green]")
+        return
+
     # --resume: auto-detect what can be skipped
     skip_merge = False
     if resume:
+        _verify_resume_compatibility(gptq_dir, model, quant_cfg, revision)
         if adapter_dir.exists() and (adapter_dir / "adapter_config.json").exists():
             skip_finetune = True
             console.print(
@@ -326,7 +506,11 @@ def run_cmd(
                 run_name=run_name,
                 output_dir=str(base_dir),
                 lora_rank=lora_rank,
-                lora_alpha=lora_alpha if lora_alpha is not None else lora_rank * 2,
+                lora_alpha=(
+                    lora_alpha
+                    if lora_alpha is not None
+                    else lora_rank * LORA_ALPHA_MULTIPLIER
+                ),
                 lora_dropout=lora_dropout,
                 max_seq_len=max_seq_len,
                 num_epochs=epochs,
@@ -341,6 +525,8 @@ def run_cmd(
                 languages=lang_list,
                 max_special_ratio=max_special_ratio,
                 trust_remote_code=trust_remote_code,
+                revision=revision,
+                target_modules=target_module_list,
             )
             train(cfg)
         else:
@@ -364,7 +550,11 @@ def run_cmd(
             )
         else:
             merge_adapter(
-                model, adapter_dir, merged_dir, trust_remote_code=trust_remote_code
+                model,
+                adapter_dir,
+                merged_dir,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
             )
 
         if skip_quantize:
@@ -376,17 +566,7 @@ def run_cmd(
         # ── Phase 3: GPTQ Quantize ────────────────────────────────────
         _step_bar(2, steps)
 
-        quantize(
-            merged_dir,
-            gptq_dir,
-            QuantizeConfig(
-                bits=q_bits,
-                format=q_format,
-                group_size=gptq_group_size,
-                calibration_dataset=calibration,
-                trust_remote_code=trust_remote_code,
-            ),
-        )
+        quantize(merged_dir, gptq_dir, quant_cfg)
 
         _step_bar(len(steps), steps)
 
@@ -424,7 +604,7 @@ def quantize_cmd(
             help="Quantization type: int4, int8, or fp8.",
         ),
     ] = "int4",
-    group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 32,
+    group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
     desc_act: Annotated[
         bool, typer.Option("--desc-act", help="Use activation order (slower, better).")
     ] = False,
@@ -433,10 +613,28 @@ def quantize_cmd(
     ] = "fineweb-edu",
     n_calibration_samples: Annotated[
         int, typer.Option(help="Number of calibration samples.")
-    ] = 512,
+    ] = 128,
     calibration_seq_len: Annotated[
         int, typer.Option(help="Calibration sequence length.")
     ] = 2048,
+    no_chat_template: Annotated[
+        bool,
+        typer.Option(
+            "--no-chat-template",
+            help="Calibrate on raw text instead of applying the model's chat template.",
+        ),
+    ] = False,
+    allow_partial_coverage: Annotated[
+        bool,
+        typer.Option(
+            "--allow-partial-coverage",
+            help="Permit layers to be left unquantized instead of failing.",
+        ),
+    ] = False,
+    revision: Annotated[
+        str | None,
+        typer.Option("--revision", help="Pin the model to a git revision."),
+    ] = None,
     trust_remote_code: Annotated[
         bool, typer.Option(help="Allow loading models with custom code.")
     ] = False,
@@ -446,26 +644,15 @@ def quantize_cmd(
     ] = None,
 ) -> None:
     """Quantize an already-merged model (GPTQ int4/int8 or FP8)."""
-    from aft.config import QuantizeConfig
-    from aft.pipeline import AftError, quantize
+    from aft.errors import AftError
+    from aft.pipeline import quantize
 
     _banner()
 
-    # Derive bits, format, and vLLM flag from quant_type
-    if quant_type == "fp8":
-        q_bits = 8
-        q_format = "fp8"
-        vllm_flag = "fp8"
-    elif quant_type == "int8":
-        q_bits = 8
-        q_format = "gptq"
-        vllm_flag = "gptq_marlin"
-    else:
-        q_bits = 4
-        q_format = "gptq"
-        vllm_flag = "gptq_marlin"
+    q_bits, q_format, _, _ = _resolve_quant_type(quant_type)
+    vllm_flag = "fp8" if q_format == "fp8" else "gptq_marlin"
 
-    cfg = QuantizeConfig(
+    cfg = _build_quant_config(
         bits=q_bits,
         format=q_format,
         group_size=group_size,
@@ -474,6 +661,9 @@ def quantize_cmd(
         n_calibration_samples=n_calibration_samples,
         calibration_seq_len=calibration_seq_len,
         trust_remote_code=trust_remote_code,
+        revision=revision,
+        use_chat_template=not no_chat_template,
+        strict_layer_coverage=not allow_partial_coverage,
     )
     try:
         quantize(merged_model, output, cfg, token=token)
