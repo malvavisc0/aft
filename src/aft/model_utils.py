@@ -314,6 +314,23 @@ def copy_auxiliary_files(source: str | Path, destination: Path) -> list[str]:
 # ── Safetensors shard resolution ──────────────────────────────────────────
 
 
+def _checkpoint_key_candidates(name: str) -> list[str]:
+    """Names to try against on-disk checkpoint keys, most specific first.
+
+    Some loaders (e.g. GPTQModel) wrap the HF model in an extra ``.model``
+    attribute, so a live parameter's qualified name can carry one more
+    leading ``model.`` segment than the key actually stored in the
+    safetensors checkpoint. Try the exact name first, then progressively
+    strip leading ``model.`` segments.
+    """
+    candidates = [name]
+    stripped = name
+    while stripped.startswith("model."):
+        stripped = stripped[len("model.") :]
+        candidates.append(stripped)
+    return candidates
+
+
 def shards_for(model_path: Path, needed: set[str]) -> list[Path]:
     """Resolve which shard files hold ``needed`` tensors, via the index map.
 
@@ -333,8 +350,15 @@ def shards_for(model_path: Path, needed: set[str]) -> list[Path]:
                 f"  The file exists but could not be parsed as JSON.\n"
                 f"  This usually means the checkpoint is corrupted."
             ) from exc
-        shard_names = {weight_map[name] for name in needed if name in weight_map}
-        missing = needed - set(weight_map)
+        shard_names: set[str] = set()
+        missing: set[str] = set()
+        for name in needed:
+            for cand in _checkpoint_key_candidates(name):
+                if cand in weight_map:
+                    shard_names.add(weight_map[cand])
+                    break
+            else:
+                missing.add(name)
         if missing:
             logger.warning(
                 "{} tensor(s) absent from the safetensors index (e.g. {})",
@@ -429,8 +453,11 @@ def materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
         if not needed:
             break
         weights = load_file(str(shard), device="cpu")
-        for key in needed & weights.keys():
-            found[key] = weights[key]
+        for name in list(needed):
+            for cand in _checkpoint_key_candidates(name):
+                if cand in weights:
+                    found[name] = weights[cand]
+                    break
         needed -= found.keys()
 
     if needed:
