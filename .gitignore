@@ -14,3 +14,4 @@ download.log
 htmlcov/
 .coverage
 coverage.xml
+models/
