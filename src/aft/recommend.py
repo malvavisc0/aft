@@ -22,7 +22,7 @@ def detect_system_ram_mib() -> int | None:
                 if line.startswith("MemTotal:"):
                     kb = int(line.split()[1])
                     return kb // 1024
-    except FileNotFoundError, ValueError:
+    except (FileNotFoundError, ValueError):
         pass
     return None
 
@@ -133,35 +133,14 @@ _TIERS: list[tuple[float, int, float, int, str]] = [
 ]
 
 
-def recommend(
-    model_info: ModelInfo,
-    vram_mib: int,
-    ram_mib: int | None,
-    bf16_supported: bool,
-    gpu_vram_mib: list[int] | None = None,
-) -> Recommendation:
-    """Compute recommended QLoRA SFT parameters for the given hardware.
-
-    Args:
-        model_info: Model metadata from :func:`fetch_model_info`.
-        vram_mib: Total GPU VRAM in MiB.
-        ram_mib: Total system RAM in MiB, or ``None`` if undetectable.
-        bf16_supported: Whether the GPU supports BF16.
-        gpu_vram_mib: Per-GPU VRAM list in MiB. When provided,
-            ``max_memory`` will set per-device limits for each GPU.
-
-    Returns:
-        A :class:`Recommendation` with hyper-parameters and reasoning.
-    """
+def _architecture_reasoning(
+    model_info: ModelInfo, ram_mib: int | None, ram_gib: float
+) -> list[str]:
+    """Warnings about checkpoint size, MoE, hybrid attention, multimodal."""
     reasoning: list[str] = []
-    params_b = model_info.params_b
-    vram_gib = vram_mib / 1024
-    ram_gib = ram_mib / 1024 if ram_mib is not None else 0
-
-    reasoning.append(f"Model ~{params_b:.1f}B params on {vram_gib:.1f} GiB VRAM")
-
-    # ── Architecture warnings ──────────────────────────────────────────
-    checkpoint_gib = checkpoint_size_gib(params_b * 1e9, model_info.dtype_bytes)
+    checkpoint_gib = checkpoint_size_gib(
+        model_info.params_b * 1e9, model_info.dtype_bytes
+    )
     reasoning.append(
         f"Checkpoint ≈ {checkpoint_gib:.0f} GiB"
         f" ({model_info.dtype_bytes} bytes/param);"
@@ -196,6 +175,99 @@ def recommend(
             "⚠ Multimodal architecture — requires a processor-aware"
             " loader, not AutoModelForCausalLM"
         )
+    return reasoning
+
+
+def _size_tier(params_b: float) -> tuple[int, float, int, str]:
+    """Pick (lora_rank, lr, epochs, label) from the data-driven tiers."""
+    for max_params, lora_rank, lr, epochs, label in _TIERS:
+        if params_b < max_params:
+            return lora_rank, lr, epochs, label
+    return _TIERS[-1][1:]  # pragma: no cover - _TIERS ends with inf
+
+
+def _seq_len_batch(
+    remaining_gib: float,
+    vram_gib: float,
+    ram_gib: float,
+    gpu_vram_mib: list[int] | None,
+) -> tuple[int, int, dict[str, str] | None, str]:
+    """Tune seq_len/batch/max_memory for the remaining VRAM budget.
+
+    Returns ``(max_seq_len, batch_size, max_memory, reason)``.
+    """
+    if remaining_gib < 1.0:
+        max_memory: dict[str, str] = {}
+        if gpu_vram_mib:
+            for i, vram in enumerate(gpu_vram_mib):
+                max_memory[str(i)] = f"{int(vram / 1024 * 0.9)}GiB"
+        else:
+            max_memory["0"] = f"{int(vram_gib * 0.9)}GiB"
+        max_memory["cpu"] = f"{int(ram_gib * 0.8)}GiB"
+        return (
+            512,
+            1,
+            max_memory,
+            (
+                f"VRAM very tight ({remaining_gib:.1f} GiB after weights) - "
+                f"seq_len=512, batch=1, CPU offload enabled"
+            ),
+        )
+    if remaining_gib < 4.0:
+        return (
+            1024,
+            1,
+            None,
+            (f"VRAM tight ({remaining_gib:.1f} GiB remaining) → seq_len=1024, batch=1"),
+        )
+    if remaining_gib < 10.0:
+        return (
+            2048,
+            1,
+            None,
+            (
+                f"VRAM moderate ({remaining_gib:.1f} GiB remaining) → "
+                f"seq_len=2048, batch=1"
+            ),
+        )
+    return (
+        2048,
+        2,
+        None,
+        (
+            f"VRAM comfortable ({remaining_gib:.1f} GiB remaining) → "
+            f"seq_len=2048, batch=2"
+        ),
+    )
+
+
+def recommend(
+    model_info: ModelInfo,
+    vram_mib: int,
+    ram_mib: int | None,
+    bf16_supported: bool,
+    gpu_vram_mib: list[int] | None = None,
+) -> Recommendation:
+    """Compute recommended QLoRA SFT parameters for the given hardware.
+
+    Args:
+        model_info: Model metadata from :func:`fetch_model_info`.
+        vram_mib: Total GPU VRAM in MiB.
+        ram_mib: Total system RAM in MiB, or ``None`` if undetectable.
+        bf16_supported: Whether the GPU supports BF16.
+        gpu_vram_mib: Per-GPU VRAM list in MiB. When provided,
+            ``max_memory`` will set per-device limits for each GPU.
+
+    Returns:
+        A :class:`Recommendation` with hyper-parameters and reasoning.
+    """
+    reasoning: list[str] = []
+    params_b = model_info.params_b
+    vram_gib = vram_mib / 1024
+    ram_gib = ram_mib / 1024 if ram_mib is not None else 0
+
+    reasoning.append(f"Model ~{params_b:.1f}B params on {vram_gib:.1f} GiB VRAM")
+    reasoning.extend(_architecture_reasoning(model_info, ram_mib, ram_gib))
 
     if gpu_vram_mib and len(gpu_vram_mib) > 1:
         reasoning.append(
@@ -204,73 +276,23 @@ def recommend(
             f" → model shards via device_map='auto'"
         )
 
-    # ── Size-based LoRA + LR heuristics (data-driven) ──────────────────
-    for max_params, lora_rank, lr, epochs, label in _TIERS:
-        if params_b < max_params:
-            break
-    else:  # pragma: no cover - _TIERS ends with inf
-        lora_rank, lr, epochs, label = _TIERS[-1][1:]
-
+    lora_rank, lr, epochs, label = _size_tier(params_b)
     epoch_word = "epoch" if epochs == 1 else "epochs"
     reasoning.append(f"{label} → rank {lora_rank}, lr {lr}, {epochs} {epoch_word}")
 
-    lora_alpha = lora_rank * LORA_ALPHA_MULTIPLIER
-
-    # ── QLoRA 4-bit memory estimation ──────────────────────────────────
     base_weights_gib = params_b * 0.55
-    overhead_gib = 2.0
-
     reasoning.append(f"QLoRA 4-bit base weights ≈ {base_weights_gib:.1f} GiB")
 
-    # ── Seq len + batch size tuning ────────────────────────────────────
-    available_gib = vram_gib * 0.85
-    remaining_gib = available_gib - base_weights_gib - overhead_gib
+    remaining_gib = vram_gib * 0.85 - base_weights_gib - 2.0
+    max_seq_len, batch_size, max_memory, mem_reason = _seq_len_batch(
+        remaining_gib, vram_gib, ram_gib, gpu_vram_mib
+    )
+    reasoning.append(mem_reason)
 
-    if remaining_gib < 1.0:
-        max_seq_len = 512
-        batch_size = 1
-        max_memory: dict[str, str] = {}
-        if gpu_vram_mib:
-            for i, vram in enumerate(gpu_vram_mib):
-                max_memory[str(i)] = f"{int(vram / 1024 * 0.9)}GiB"
-        else:
-            max_memory["0"] = f"{int(vram_gib * 0.9)}GiB"
-        max_memory["cpu"] = f"{int(ram_gib * 0.8)}GiB"
-        reasoning.append(
-            f"VRAM very tight ({remaining_gib:.1f} GiB after weights) - "
-            f"seq_len={max_seq_len}, batch=1, CPU offload enabled"
-        )
-    elif remaining_gib < 4.0:
-        max_seq_len = 1024
-        batch_size = 1
-        max_memory = None
-        reasoning.append(
-            f"VRAM tight ({remaining_gib:.1f} GiB remaining) → "
-            f"seq_len={max_seq_len}, batch={batch_size}"
-        )
-    elif remaining_gib < 10.0:
-        max_seq_len = 2048
-        batch_size = 1
-        max_memory = None
-        reasoning.append(
-            f"VRAM moderate ({remaining_gib:.1f} GiB remaining) → "
-            f"seq_len={max_seq_len}, batch={batch_size}"
-        )
-    else:
-        max_seq_len = 2048
-        batch_size = 2
-        max_memory = None
-        reasoning.append(
-            f"VRAM comfortable ({remaining_gib:.1f} GiB remaining) → "
-            f"seq_len={max_seq_len}, batch={batch_size}"
-        )
-
-    # ── Gradient accumulation → target effective batch ≈ 16 ────────────
-    target_effective = 16
-    grad_accum = max(1, target_effective // batch_size)
+    grad_accum = max(1, 16 // batch_size)
     reasoning.append(
         f"Effective batch size: {batch_size} × {grad_accum} = "
-        f"{batch_size * grad_accum} (target ~{target_effective})"
+        f"{batch_size * grad_accum} (target ~16)"
     )
 
     if bf16_supported:
@@ -278,7 +300,7 @@ def recommend(
 
     return Recommendation(
         lora_rank=lora_rank,
-        lora_alpha=lora_alpha,
+        lora_alpha=lora_rank * LORA_ALPHA_MULTIPLIER,
         max_seq_len=max_seq_len,
         batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,

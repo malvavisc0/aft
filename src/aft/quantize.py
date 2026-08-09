@@ -94,132 +94,134 @@ def apply_chat_template(tokenizer: Any, text: str) -> str:
 # ── Calibration data ──────────────────────────────────────────────────────
 
 
-def get_calibration_data(
+def _collect_texts(data: Any, n_samples: int, preferred_field: str | None) -> list[str]:
+    """Pull up to ``n_samples`` non-empty texts from a streaming dataset."""
+    texts: list[str] = []
+    for row in data:
+        raw = flatten_row_to_text(row, preferred_field)
+        if raw is None:
+            continue
+        text = raw.strip()
+        if len(text) > MIN_CALIBRATION_TEXT_LEN:
+            texts.append(text)
+        if len(texts) >= n_samples:
+            break
+    return texts
+
+
+def _load_registry_calibration(
+    hf_datasets: Any, dataset_name: str, n_samples: int
+) -> list[str]:
+    """Load a named calibration preset from the registry."""
+    spec = _HF_CALIBRATION_DATASETS[dataset_name]
+    hf_repo = spec["repo"]
+    preferred_field = spec.get("field")
+    config_name = spec.get("config")
+    data_dir = spec.get("data_dir")
+    split = spec.get("split") or "train"
+    is_gated = bool(spec.get("gated"))
+    where = f"{hf_repo}/{data_dir}" if data_dir else hf_repo
+    console.print(
+        f"[cyan]Loading {where}"
+        f"{f' ({config_name})' if config_name else ''}"
+        f" split {split}"
+        f" for calibration ({n_samples} samples)...[/cyan]"
+    )
+
+    load_kwargs: dict[str, Any] = {"split": split, "streaming": True}
+    if config_name:
+        load_kwargs["name"] = config_name
+    if data_dir:
+        load_kwargs["data_dir"] = data_dir
+    try:
+        data = hf_datasets.load_dataset(hf_repo, **load_kwargs)
+    except Exception as exc:
+        if is_gated:
+            raise AftError(
+                f"Could not load gated dataset '{hf_repo}': {exc}\n"
+                f"  Gated datasets require you to accept the access"
+                f" terms on the dataset's HF page, and to supply a"
+                f" token (HF_TOKEN env var or --token).\n"
+                f"  Open: https://huggingface.co/datasets/{hf_repo}"
+            ) from exc
+        raise
+    return _collect_texts(data, n_samples, preferred_field)
+
+
+def _load_jsonl_calibration(path: Path) -> list[str]:
+    """Load calibration texts from a local JSONL file."""
+    from aft.cleaning import supported_text_columns
+
+    texts: list[str] = []
+    for i, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+            raw = flatten_row_to_text(row, None)
+            if raw is None:
+                raise AftError(
+                    f"Calibration JSONL line {i}: no supported text"
+                    f" column in {path}.\n"
+                    f"  Expected {supported_text_columns()}.\n"
+                    f"  Found keys: {', '.join(list(row)[:10])}"
+                )
+            texts.append(raw)
+        except json.JSONDecodeError as exc:
+            raise AftError(
+                f"Calibration JSONL line {i}: invalid JSON in {path}"
+            ) from exc
+    return texts
+
+
+def _load_hf_calibration(
+    hf_datasets: Any, dataset_name: str, n_samples: int
+) -> list[str]:
+    """Load calibration texts from an arbitrary HF dataset repo id."""
+    console.print(
+        f"[cyan]'{dataset_name}' is not a known alias or local file"
+        f" — trying it as a HuggingFace dataset"
+        f" ({n_samples} samples)...[/cyan]"
+    )
+    split = resolve_dataset_split(dataset_name, "train")
+    data = hf_datasets.load_dataset(dataset_name, split=split, streaming=True)
+    return _collect_texts(data, n_samples, None)
+
+
+def _resolve_calibration_texts(
     tokenizer: Any,
     dataset_name: str,
     n_samples: int,
-    seq_len: int,
-    *,
-    use_chat_template: bool = False,
-) -> list[dict[str, Any]]:
-    """Build tokenized calibration samples for GPTQ / FP8 quantization."""
+) -> list[str]:
+    """Resolve a calibration source name into raw text samples."""
     import datasets as hf_datasets
 
     if dataset_name in _HF_CALIBRATION_DATASETS:
-        spec = _HF_CALIBRATION_DATASETS[dataset_name]
-        hf_repo = spec["repo"]
-        preferred_field = spec.get("field")
-        config_name = spec.get("config")
-        data_dir = spec.get("data_dir")
-        split = spec.get("split") or "train"
-        is_gated = bool(spec.get("gated"))
-        where = f"{hf_repo}/{data_dir}" if data_dir else hf_repo
-        console.print(
-            f"[cyan]Loading {where}"
-            f"{f' ({config_name})' if config_name else ''}"
-            f" split {split}"
-            f" for calibration ({n_samples} samples)...[/cyan]"
-        )
+        return _load_registry_calibration(hf_datasets, dataset_name, n_samples)
 
-        load_kwargs: dict[str, Any] = {"split": split, "streaming": True}
-        if config_name:
-            load_kwargs["name"] = config_name
-        if data_dir:
-            load_kwargs["data_dir"] = data_dir
-        try:
-            data = hf_datasets.load_dataset(hf_repo, **load_kwargs)
-        except Exception as exc:
-            if is_gated:
-                raise AftError(
-                    f"Could not load gated dataset '{hf_repo}': {exc}\n"
-                    f"  Gated datasets require you to accept the access"
-                    f" terms on the dataset's HF page, and to supply a"
-                    f" token (HF_TOKEN env var or --token).\n"
-                    f"  Open: https://huggingface.co/datasets/{hf_repo}"
-                ) from exc
-            raise
+    p = Path(dataset_name)
+    if p.exists():
+        return _load_jsonl_calibration(p)
+    return _load_hf_calibration(hf_datasets, dataset_name, n_samples)
 
-        texts: list[str] = []
-        for row in data:
-            raw = flatten_row_to_text(row, preferred_field)
-            if raw is None:
-                continue
-            text = raw.strip()
-            if len(text) > MIN_CALIBRATION_TEXT_LEN:
-                texts.append(text)
-            if len(texts) >= n_samples:
-                break
 
-    else:
-        # Local JSONL fallback, *or* an arbitrary HF dataset repo id.
-        p = Path(dataset_name)
-        if p.exists():
-            texts = []
-            for i, line in enumerate(p.read_text().splitlines(), 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                    raw = flatten_row_to_text(row, None)
-                    if raw is None:
-                        from aft.cleaning import supported_text_columns
-
-                        raise AftError(
-                            f"Calibration JSONL line {i}: no supported"
-                            f" text column in {p}.\n"
-                            f"  Expected {supported_text_columns()}.\n"
-                            f"  Found keys: {', '.join(list(row)[:10])}"
-                        )
-                    texts.append(raw)
-                except json.JSONDecodeError as exc:
-                    raise AftError(
-                        f"Calibration JSONL line {i}: invalid JSON in {p}"
-                    ) from exc
-        else:
-            console.print(
-                f"[cyan]'{dataset_name}' is not a known alias or local"
-                f" file — trying it as a HuggingFace dataset"
-                f" ({n_samples} samples)...[/cyan]"
-            )
-            split = resolve_dataset_split(dataset_name, "train")
-            data = hf_datasets.load_dataset(dataset_name, split=split, streaming=True)
-            texts = []
-            for row in data:
-                raw = flatten_row_to_text(row, None)
-                if raw is None:
-                    continue
-                text = raw.strip()
-                if len(text) > MIN_CALIBRATION_TEXT_LEN:
-                    texts.append(text)
-                if len(texts) >= n_samples:
-                    break
-
-    if not texts:
-        raise AftError(
-            f"Calibration source '{dataset_name}' produced no usable"
-            f" samples.\n"
-            f"  Every row was empty or shorter than"
-            f" {MIN_CALIBRATION_TEXT_LEN} characters."
-        )
-    if len(texts) < n_samples:
+def _apply_chat_templates(tokenizer: Any, texts: list[str]) -> list[str]:
+    """Wrap each text in the model's chat template, when available."""
+    if not getattr(tokenizer, "chat_template", None):
         logger.warning(
-            "Only {} of the requested {} calibration samples were available",
-            len(texts),
-            n_samples,
+            "use_chat_template requested but the tokenizer has"
+            " no chat_template; calibrating on raw text"
         )
+        return texts
+    console.print("[cyan]Applying the model's chat template.[/cyan]")
+    return [apply_chat_template(tokenizer, t) for t in texts]
 
-    if use_chat_template:
-        if getattr(tokenizer, "chat_template", None):
-            console.print("[cyan]Applying the model's chat template.[/cyan]")
-            texts = [apply_chat_template(tokenizer, t) for t in texts]
-        else:
-            logger.warning(
-                "use_chat_template requested but the tokenizer has"
-                " no chat_template; calibrating on raw text"
-            )
 
-    # Tokenize
+def _tokenize_calibration(
+    tokenizer: Any, texts: list[str], seq_len: int
+) -> list[dict[str, Any]]:
+    """Tokenize texts into per-sample input tensors."""
     samples: list[dict[str, Any]] = []
     skipped = 0
     for text in texts:
@@ -242,9 +244,39 @@ def get_calibration_data(
         )
     if not samples:
         raise AftError("All calibration samples tokenized to zero tokens.")
-
     console.print(f"[cyan]Prepared {len(samples)} calibration samples.[/cyan]")
     return samples
+
+
+def get_calibration_data(
+    tokenizer: Any,
+    dataset_name: str,
+    n_samples: int,
+    seq_len: int,
+    *,
+    use_chat_template: bool = False,
+) -> list[dict[str, Any]]:
+    """Build tokenized calibration samples for GPTQ / FP8 quantization."""
+    texts = _resolve_calibration_texts(tokenizer, dataset_name, n_samples)
+
+    if not texts:
+        raise AftError(
+            f"Calibration source '{dataset_name}' produced no usable"
+            f" samples.\n"
+            f"  Every row was empty or shorter than"
+            f" {MIN_CALIBRATION_TEXT_LEN} characters."
+        )
+    if len(texts) < n_samples:
+        logger.warning(
+            "Only {} of the requested {} calibration samples were available",
+            len(texts),
+            n_samples,
+        )
+
+    if use_chat_template:
+        texts = _apply_chat_templates(tokenizer, texts)
+
+    return _tokenize_calibration(tokenizer, texts, seq_len)
 
 
 # ── Layer coverage reporting ──────────────────────────────────────────────

@@ -15,6 +15,12 @@ from typing import Any
 import torch
 from loguru import logger
 
+from aft.cleaning import (
+    flatten_row_to_text,
+    parse_dataset_spec,
+    resolve_dataset_split,
+    supported_text_columns,
+)
 from aft.config import QuantizeConfig, TrainConfig
 from aft.errors import AftError
 from aft.model_utils import (
@@ -41,6 +47,34 @@ def _hf_token() -> str | None:
     return os.getenv("HF_TOKEN") or None
 
 
+_SUPPORTED_TEXT_COLUMNS: frozenset[str] = frozenset(
+    {"text", "content", "code", "body", "messages", "conversations"}
+)
+
+
+def _load_training_texts(datasets: list[str], hf_token: str | None) -> list[str]:
+    """Load and flatten every named dataset into a single text list."""
+    import datasets as hf_datasets
+
+    console.print(f"[cyan]Loading datasets: {datasets}[/cyan]")
+    all_texts: list[str] = []
+    for ds_spec in datasets:
+        ds_id, requested_split = parse_dataset_spec(ds_spec)
+        split = resolve_dataset_split(ds_id, requested_split, token=hf_token)
+        ds = hf_datasets.load_dataset(ds_id, split=split, token=hf_token)
+        if not (set(ds.column_names) & _SUPPORTED_TEXT_COLUMNS):
+            raise AftError(
+                f"Dataset {ds_id} has no supported text column.\n"
+                f"  Expected {supported_text_columns()}.\n"
+                f"  Columns found: {', '.join(ds.column_names)}"
+            )
+        for row in ds:
+            text = flatten_row_to_text(row)
+            if text:
+                all_texts.append(text)
+    return all_texts
+
+
 def train(config: TrainConfig) -> Path:
     """Run QLoRA supervised fine-tuning."""
     import datasets as hf_datasets
@@ -48,13 +82,7 @@ def train(config: TrainConfig) -> Path:
     from transformers import BitsAndBytesConfig
     from trl import SFTConfig, SFTTrainer
 
-    from aft.cleaning import (
-        clean_dataset,
-        flatten_row_to_text,
-        parse_dataset_spec,
-        resolve_dataset_split,
-        supported_text_columns,
-    )
+    from aft.cleaning import clean_dataset
 
     silence_noisy_loggers()
 
@@ -112,31 +140,7 @@ def train(config: TrainConfig) -> Path:
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    console.print(f"[cyan]Loading datasets: {config.datasets}[/cyan]")
-    all_texts: list[str] = []
-    for ds_spec in config.datasets:
-        ds_id, requested_split = parse_dataset_spec(ds_spec)
-        split = resolve_dataset_split(ds_id, requested_split, token=hf_token)
-        ds = hf_datasets.load_dataset(ds_id, split=split, token=hf_token)
-        # Fast-fail on an unsupported schema before iterating.
-        supported = {
-            "text",
-            "content",
-            "code",
-            "body",
-            "messages",
-            "conversations",
-        }
-        if not (set(ds.column_names) & supported):
-            raise AftError(
-                f"Dataset {ds_id} has no supported text column.\n"
-                f"  Expected {supported_text_columns()}.\n"
-                f"  Columns found: {', '.join(ds.column_names)}"
-            )
-        for row in ds:
-            text = flatten_row_to_text(row)
-            if text:
-                all_texts.append(text)
+    all_texts = _load_training_texts(config.datasets, hf_token)
 
     dataset = hf_datasets.Dataset.from_dict({"text": all_texts})
     if config.max_samples:

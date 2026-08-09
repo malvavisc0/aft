@@ -241,6 +241,21 @@ def load_model_inputs(
 # ── LoRA target discovery ─────────────────────────────────────────────────
 
 
+def _linear_leaf_names(model: torch.nn.Module) -> set[str]:
+    """Names of 2-D-weight leaf modules (the quantizable linear projections)."""
+    names: set[str] = set()
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or getattr(weight, "ndim", 0) != 2:
+            continue
+        if len(list(module.children())) > 0:
+            continue
+        names.add(name.split(".")[-1])
+    return names
+
+
 def discover_lora_targets(
     model: torch.nn.Module, explicit: list[str] | None = None
 ) -> list[str]:
@@ -255,29 +270,19 @@ def discover_lora_targets(
         logger.info("Using explicit LoRA target modules: {}", ", ".join(explicit))
         return explicit
 
-    linear_leaf_names: set[str] = set()
-    for name, module in model.named_modules():
-        if not name:
-            continue
-        weight = getattr(module, "weight", None)
-        if weight is None or getattr(weight, "ndim", 0) != 2:
-            continue
-        if len(list(module.children())) > 0:
-            continue
-        linear_leaf_names.add(name.split(".")[-1])
-
-    targets = sorted(n for n in linear_leaf_names if n in LORA_CANDIDATE_SUFFIXES)
+    leaf_names = _linear_leaf_names(model)
+    targets = sorted(n for n in leaf_names if n in LORA_CANDIDATE_SUFFIXES)
     if not targets:
         raise AftError(
             "Could not discover any LoRA target modules on this model.\n"
             f"  Linear leaf module names found: "
-            f"{', '.join(sorted(linear_leaf_names)[:20]) or '(none)'}\n"
+            f"{', '.join(sorted(leaf_names)[:20]) or '(none)'}\n"
             "  This architecture is not covered by the default projection\n"
             "  names. Pass --target-modules with an explicit comma-separated\n"
             "  list to proceed."
         )
 
-    missing = sorted(set(LORA_CANDIDATE_SUFFIXES) - linear_leaf_names)
+    missing = sorted(set(LORA_CANDIDATE_SUFFIXES) - leaf_names)
     logger.info("Discovered LoRA target modules: {}", ", ".join(targets))
     logger.debug("Candidate names not present on this model: {}", ", ".join(missing))
     return targets
@@ -466,6 +471,76 @@ def _recompute_rope_buffers(model: torch.nn.Module) -> int:
     return fixed
 
 
+def _load_meta_tensors(needed: set[str], shards: list[Path]) -> dict[str, torch.Tensor]:
+    """Read the named tensors from safetensors shards, with key-alias fallback."""
+    from safetensors.torch import load_file
+
+    found: dict[str, torch.Tensor] = {}
+    remaining = set(needed)
+    for shard in shards:
+        if not remaining:
+            break
+        weights = load_file(str(shard), device="cpu")
+        for name in list(remaining):
+            for cand in _checkpoint_key_candidates(name):
+                if cand in weights:
+                    found[name] = weights[cand]
+                    break
+        remaining -= found.keys()
+    return found
+
+
+def _install_meta_tensors(
+    model: torch.nn.Module,
+    meta_params: dict[str, torch.Tensor],
+    meta_buffers: dict[str, torch.Tensor],
+    found: dict[str, torch.Tensor],
+) -> int:
+    """Install loaded weights for every meta param/buffer, preserving ties."""
+    tied: dict[int, torch.Tensor] = {}
+    materialized = 0
+    for name, param in meta_params.items():
+        materialized += _install_meta_tensor(
+            model, name, param, found, tied, as_parameter=True
+        )
+    for name, buffer in meta_buffers.items():
+        materialized += _install_meta_tensor(
+            model, name, buffer, found, tied, as_parameter=False
+        )
+    return materialized
+
+
+def _collect_meta(
+    model: torch.nn.Module,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Return ``(meta_params, meta_buffers)`` still on the meta device."""
+    meta_params = {name: p for name, p in model.named_parameters() if p.is_meta}
+    meta_buffers = {name: b for name, b in model.named_buffers() if b.is_meta}
+    return meta_params, meta_buffers
+
+
+def _resolve_meta_weights(
+    model_path: Path, all_names: list[str]
+) -> dict[str, torch.Tensor]:
+    """Locate and load the named tensors from the checkpoint shards."""
+    shards = shards_for(model_path, set(all_names))
+    if not shards:
+        raise AftError(
+            f"{len(all_names)} tensors are still on the meta device but"
+            f" no safetensors shards were found in {model_path}.\n"
+            "  Quantizing now would silently produce garbage weights."
+        )
+    found = _load_meta_tensors(set(all_names), shards)
+    missing = set(all_names) - found.keys()
+    if missing:
+        raise AftError(
+            f"{len(missing)} meta tensor(s) have no value in the checkpoint:\n"
+            f"  {', '.join(sorted(missing)[:8])}\n"
+            "  Refusing to quantize an incompletely materialized model."
+        )
+    return found
+
+
 def materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
     """Load real weights for any parameters/buffers stuck on the meta device.
 
@@ -478,12 +553,9 @@ def materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
 
     Returns the number of tensors that were materialized.
     """
-    from safetensors.torch import load_file
-
     _recompute_rope_buffers(model)
 
-    meta_params = {name: p for name, p in model.named_parameters() if p.is_meta}
-    meta_buffers = {name: b for name, b in model.named_buffers() if b.is_meta}
+    meta_params, meta_buffers = _collect_meta(model)
     if not meta_params and not meta_buffers:
         return 0
 
@@ -495,46 +567,8 @@ def materialize_meta_params(model: torch.nn.Module, model_path: Path) -> int:
         ", ".join(all_names[:8]) + ("..." if len(all_names) > 8 else ""),
     )
 
-    shards = shards_for(model_path, set(all_names))
-    if not shards:
-        raise AftError(
-            f"{len(all_names)} tensors are still on the meta device but"
-            f" no safetensors shards were found in {model_path}.\n"
-            "  Quantizing now would silently produce garbage weights."
-        )
-
-    needed = set(all_names)
-    found: dict[str, torch.Tensor] = {}
-    for shard in shards:
-        if not needed:
-            break
-        weights = load_file(str(shard), device="cpu")
-        for name in list(needed):
-            for cand in _checkpoint_key_candidates(name):
-                if cand in weights:
-                    found[name] = weights[cand]
-                    break
-        needed -= found.keys()
-
-    if needed:
-        raise AftError(
-            f"{len(needed)} meta tensor(s) have no value in the"
-            f" checkpoint:\n"
-            f"  {', '.join(sorted(needed)[:8])}\n"
-            "  Refusing to quantize an incompletely materialized model."
-        )
-
-    tied: dict[int, torch.Tensor] = {}
-    materialized = 0
-
-    for name, param in meta_params.items():
-        materialized += _install_meta_tensor(
-            model, name, param, found, tied, as_parameter=True
-        )
-    for name, buffer in meta_buffers.items():
-        materialized += _install_meta_tensor(
-            model, name, buffer, found, tied, as_parameter=False
-        )
+    found = _resolve_meta_weights(model_path, all_names)
+    materialized = _install_meta_tensors(model, meta_params, meta_buffers, found)
 
     remaining = [n for n, p in model.named_parameters() if p.is_meta]
     if remaining:

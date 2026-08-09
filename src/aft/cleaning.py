@@ -31,6 +31,15 @@ _MESSAGE_ROLE_CONTENT_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _block_text(block) -> str:
+    """Text from a single content block (dict or bare string)."""
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict):
+        return block.get("text") or block.get("content") or ""
+    return ""
+
+
 def _message_text(content) -> str:
     """Extract text from a message ``content`` field.
 
@@ -40,13 +49,7 @@ def _message_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict):
-                parts.append(block.get("text") or block.get("content") or "")
-            elif isinstance(block, str):
-                parts.append(block)
-        return " ".join(p for p in parts if p)
+        return " ".join(b for b in (_block_text(x) for x in content) if b)
     return str(content) if content is not None else ""
 
 
