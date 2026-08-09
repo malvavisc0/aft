@@ -14,6 +14,7 @@ from typing import Any
 import torch
 from loguru import logger
 
+from aft.cleaning import flatten_row_to_text, resolve_dataset_split
 from aft.config import QuantizeConfig
 from aft.errors import AftError
 from aft.model_utils import (
@@ -27,11 +28,42 @@ from aft.ui import console
 # Minimum character length for calibration text samples.
 MIN_CALIBRATION_TEXT_LEN = 100
 
-#: Maps well-known short names to HuggingFace dataset IDs.
-_HF_CALIBRATION_DATASETS: dict[str, str] = {
-    "fineweb": "HuggingFaceFW/fineweb",
-    "fineweb-edu": "HuggingFaceFW/fineweb-edu",
-    "c4": "allenai/c4",
+#: Maps well-known short names to HuggingFace dataset specs.
+#:   ``repo``     — HF dataset repo id (required).
+#:   ``field``    — row key holding the raw text or message list (optional;
+#:                  falls back through flat/message fields when absent).
+#:   ``config``   — HF dataset config name (optional, passed as ``name=``).
+#:   ``data_dir`` — load only a subdirectory of a sharded dataset (optional).
+#:   ``split``    — split name (optional; defaults to ``train`` with fallback).
+#:   ``gated``    — when truthy, the dataset requires agreeing to access terms
+#:                  on the HF web page and a ``HF_TOKEN``; a clear error is
+#:                  raised on a load failure instead of a raw traceback.
+#: Code- and agentic-flavored aliases exist so models can calibrate on a
+#: distribution closer to their serving traffic instead of general web text.
+_HF_CALIBRATION_DATASETS: dict[str, dict[str, str | None]] = {
+    "fineweb": {"repo": "HuggingFaceFW/fineweb", "field": "text"},
+    "fineweb-edu": {"repo": "HuggingFaceFW/fineweb-edu", "field": "text"},
+    "c4": {"repo": "allenai/c4", "field": "text"},
+    # Code calibration from the StarCoder training set. The full dataset is
+    # 783 GB and cannot be loaded at once; ``data_dir="python"`` streams one
+    # language. It is gated — the user must accept the terms on the dataset
+    # page and supply HF_TOKEN, or the load fails.
+    "starcoder": {
+        "repo": "bigcode/starcoderdata",
+        "field": "content",
+        "data_dir": "python",
+        "gated": True,
+    },
+    # Agentic tool-use calibration from NVIDIA's Nemotron-Agentic-v1.  The
+    # dataset has two named splits (no ``train``): ``interactive_agent``
+    # (19k judged trajectories) and ``tool_calling`` (316k).  Rows are
+    # conversational (``messages`` list), flattened by ``flatten_row_to_text``.
+    # Public (CC-BY-4.0), not gated.
+    "nemotron-agentic": {
+        "repo": "nvidia/Nemotron-Agentic-v1",
+        "field": "messages",
+        "split": "interactive_agent",
+    },
 }
 
 
@@ -74,47 +106,94 @@ def get_calibration_data(
     import datasets as hf_datasets
 
     if dataset_name in _HF_CALIBRATION_DATASETS:
-        hf_repo = _HF_CALIBRATION_DATASETS[dataset_name]
+        spec = _HF_CALIBRATION_DATASETS[dataset_name]
+        hf_repo = spec["repo"]
+        preferred_field = spec.get("field")
+        config_name = spec.get("config")
+        data_dir = spec.get("data_dir")
+        split = spec.get("split") or "train"
+        is_gated = bool(spec.get("gated"))
+        where = f"{hf_repo}/{data_dir}" if data_dir else hf_repo
         console.print(
-            f"[cyan]Loading {hf_repo} for calibration ({n_samples} samples)...[/cyan]"
+            f"[cyan]Loading {where}"
+            f"{f' ({config_name})' if config_name else ''}"
+            f" split {split}"
+            f" for calibration ({n_samples} samples)...[/cyan]"
         )
 
-        data = hf_datasets.load_dataset(
-            hf_repo,
-            split="train",
-            streaming=True,
-        )
+        load_kwargs: dict[str, Any] = {"split": split, "streaming": True}
+        if config_name:
+            load_kwargs["name"] = config_name
+        if data_dir:
+            load_kwargs["data_dir"] = data_dir
+        try:
+            data = hf_datasets.load_dataset(hf_repo, **load_kwargs)
+        except Exception as exc:
+            if is_gated:
+                raise AftError(
+                    f"Could not load gated dataset '{hf_repo}': {exc}\n"
+                    f"  Gated datasets require you to accept the access"
+                    f" terms on the dataset's HF page, and to supply a"
+                    f" token (HF_TOKEN env var or --token).\n"
+                    f"  Open: https://huggingface.co/datasets/{hf_repo}"
+                ) from exc
+            raise
 
         texts: list[str] = []
         for row in data:
-            text = row["text"].strip()
+            raw = flatten_row_to_text(row, preferred_field)
+            if raw is None:
+                continue
+            text = raw.strip()
             if len(text) > MIN_CALIBRATION_TEXT_LEN:
                 texts.append(text)
             if len(texts) >= n_samples:
                 break
 
     else:
-        # Local JSONL fallback
+        # Local JSONL fallback, *or* an arbitrary HF dataset repo id.
         p = Path(dataset_name)
-        if not p.exists():
-            raise AftError(f"Calibration JSONL not found: {p}")
+        if p.exists():
+            texts = []
+            for i, line in enumerate(p.read_text().splitlines(), 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    raw = flatten_row_to_text(row, None)
+                    if raw is None:
+                        from aft.cleaning import supported_text_columns
 
-        texts = []
-        for i, line in enumerate(p.read_text().splitlines(), 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                if "text" not in row:
+                        raise AftError(
+                            f"Calibration JSONL line {i}: no supported"
+                            f" text column in {p}.\n"
+                            f"  Expected {supported_text_columns()}.\n"
+                            f"  Found keys: {', '.join(list(row)[:10])}"
+                        )
+                    texts.append(raw)
+                except json.JSONDecodeError as exc:
                     raise AftError(
-                        f"Calibration JSONL line {i}: missing 'text' key in {p}"
-                    )
-                texts.append(row["text"])
-            except json.JSONDecodeError as exc:
-                raise AftError(
-                    f"Calibration JSONL line {i}: invalid JSON in {p}"
-                ) from exc
+                        f"Calibration JSONL line {i}: invalid JSON in {p}"
+                    ) from exc
+        else:
+            console.print(
+                f"[cyan]'{dataset_name}' is not a known alias or local"
+                f" file — trying it as a HuggingFace dataset"
+                f" ({n_samples} samples)...[/cyan]"
+            )
+            split = resolve_dataset_split(dataset_name, "train")
+            data = hf_datasets.load_dataset(dataset_name, split=split, streaming=True)
+            texts = []
+            for row in data:
+                raw = flatten_row_to_text(row, None)
+                if raw is None:
+                    continue
+                text = raw.strip()
+                if len(text) > MIN_CALIBRATION_TEXT_LEN:
+                    texts.append(text)
+                if len(texts) >= n_samples:
+                    break
 
     if not texts:
         raise AftError(
@@ -265,6 +344,96 @@ def write_provenance(
     logger.info("Wrote provenance to {}", path)
 
 
+# ── Post-save config sanitization ──────────────────────────────────────────
+
+#: Machine-local runtime fields gptqmodel writes into its quantization-config
+#: ``meta`` that must never reach a published artifact: they either leak an
+#: absolute temp path from the build host or record a host-specific VRAM
+#: decision that is meaningless to consumers.
+_LEAKED_QUANT_META_KEYS: tuple[str, ...] = ("offload_to_disk_path",)
+
+
+def _sanitize_json_file(path: Path, mutate) -> bool:
+    """Load a JSON file, apply ``mutate`` in place, rewrite if it changed.
+
+    Returns whether the file was rewritten.  All-or-nothing: if ``mutate``
+    raises or the result is not JSON-serializable, the original file is left
+    untouched and the error propagates.
+    """
+    if not path.is_file():
+        return False
+    raw = path.read_text()
+    data = json.loads(raw)
+    mutate(data)
+    new_raw = json.dumps(data, indent=2) + "\n"
+    if new_raw == raw:
+        return False
+    path.write_text(new_raw)
+    return True
+
+
+def sanitize_saved_config(output: Path) -> None:
+    """Clean gptqmodel-injected blemishes from the saved config files.
+
+    Two classes of problem are corrected:
+
+    * **Spurious top-level ``rope_parameters``.**  gptqmodel's
+      ``_normalize_rope_parameters_config_compat`` shim synthesizes a
+      top-level ``rope_parameters`` on multimodal configs (e.g. Qwen3.5)
+      whose language-model RoPE actually lives under ``text_config``.  The
+      synthesized dict falls back to ``rope_theta=10000`` and a plain
+      ``default`` rope, silently contradicting the real ``mrope`` config
+      under ``text_config``.  It is removed when a legitimate
+      ``text_config.rope_parameters`` is present.
+
+    * **Leaked local temp paths.**  The quantization-config ``meta`` records
+      ``offload_to_disk_path`` (a ``/tmp/...`` scratch dir from the build
+      host).  It is stripped from both ``config.json`` (under
+      ``quantization_config.meta``) and ``quantize_config.json`` (under
+      ``meta``).
+
+    The original source model's ``rope_parameters`` (which is absent at the
+    top level for these architectures) is the intended shape, so this only
+    ever removes gptqmodel's additions — it never invents new fields.
+    """
+    changes: list[str] = []
+
+    def _mutate_main(cfg: dict[str, Any]) -> None:
+        nonlocal changes
+        text_cfg = cfg.get("text_config")
+        if (
+            isinstance(text_cfg, dict)
+            and isinstance(text_cfg.get("rope_parameters"), dict)
+            and isinstance(cfg.get("rope_parameters"), dict)
+        ):
+            del cfg["rope_parameters"]
+            changes.append("removed spurious top-level rope_parameters")
+
+        qcfg = cfg.get("quantization_config")
+        if isinstance(qcfg, dict):
+            meta = qcfg.get("meta")
+            if isinstance(meta, dict):
+                for key in _LEAKED_QUANT_META_KEYS:
+                    if key in meta:
+                        del meta[key]
+                        changes.append(f"removed {key} from config.json")
+
+    def _mutate_quant(qcfg: dict[str, Any]) -> None:
+        nonlocal changes
+        meta = qcfg.get("meta")
+        if isinstance(meta, dict):
+            for key in _LEAKED_QUANT_META_KEYS:
+                if key in meta:
+                    del meta[key]
+                    changes.append(f"removed {key} from quantize_config.json")
+
+    _sanitize_json_file(output / "config.json", _mutate_main)
+    _sanitize_json_file(output / "quantize_config.json", _mutate_quant)
+
+    if changes:
+        logger.info("Sanitized saved config: {}", "; ".join(changes))
+
+
 # ── Quantization sub-steps ────────────────────────────────────────────────
 
 
@@ -393,6 +562,7 @@ def save_quantized_artifact(
     model.save_quantized(str(output))
     processor.save_pretrained(str(output))
     copy_auxiliary_files(model_path, output)
+    sanitize_saved_config(output)
     write_provenance(
         output,
         source=str(model_path),

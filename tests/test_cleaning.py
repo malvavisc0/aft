@@ -6,7 +6,13 @@ from unittest.mock import patch
 
 import pytest
 
-from aft.cleaning import AftError, clean_dataset
+from aft.cleaning import (
+    AftError,
+    clean_dataset,
+    flatten_row_to_text,
+    parse_dataset_spec,
+    resolve_dataset_split,
+)
 from tests.conftest import FakeDataset, FakeTokenizer, make_fake_dataset
 
 
@@ -179,3 +185,109 @@ class TestCleanDatasetEdgeCases:
         )
         assert len(result) == 1
         assert result["text"][0] == "Hello world this is a test sentence."
+
+
+class TestFlattenRowToText:
+    def test_preferred_flat_field_wins(self) -> None:
+        row = {"text": "web doc", "content": "code here"}
+        assert flatten_row_to_text(row, "text") == "web doc"
+
+    def test_preferred_field_falls_back_when_absent(self) -> None:
+        row = {"content": "def f(): pass"}
+        assert flatten_row_to_text(row, "text") == "def f(): pass"
+
+    def test_auto_flat_field_chain(self) -> None:
+        assert flatten_row_to_text({"code": "x = 1"}) == "x = 1"
+        assert flatten_row_to_text({"body": "doc"}) == "doc"
+
+    def test_openai_messages_flattened(self) -> None:
+        row = {
+            "uuid": "abc",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+            ],
+        }
+        out = flatten_row_to_text(row)
+        assert "user: hello" in out
+        assert "assistant: hi there" in out
+
+    def test_preferred_message_field(self) -> None:
+        """Nemotron-Agentic shape: preferred field is the messages list."""
+        row = {
+            "uuid": "abc",
+            "messages": [{"role": "system", "content": "be helpful"}],
+            "tools": [],
+        }
+        assert flatten_row_to_text(row, "messages") == "system: be helpful"
+
+    def test_sharegpt_from_value_shape(self) -> None:
+        row = {
+            "conversations": [
+                {"from": "human", "value": "q"},
+                {"from": "gpt", "value": "a"},
+            ]
+        }
+        out = flatten_row_to_text(row)
+        assert "human: q" in out and "gpt: a" in out
+
+    def test_content_as_block_list(self) -> None:
+        """OpenAI multi-part content blocks are joined."""
+        row = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "part1 "},
+                        {"type": "text", "text": "part2"},
+                    ],
+                },
+            ]
+        }
+        assert flatten_row_to_text(row) == "user: part1  part2"
+
+    def test_returns_none_for_unsupported(self) -> None:
+        assert flatten_row_to_text({"unrelated": 1}) is None
+
+    def test_empty_messages_returns_none(self) -> None:
+        assert flatten_row_to_text({"messages": []}) is None
+
+
+class TestParseDatasetSpec:
+    def test_plain_repo_defaults_to_train(self) -> None:
+        assert parse_dataset_spec("nvidia/Nemotron-Agentic-v1") == (
+            "nvidia/Nemotron-Agentic-v1",
+            "train",
+        )
+
+    def test_repo_with_split(self) -> None:
+        assert parse_dataset_spec("nvidia/Nemotron-Agentic-v1:interactive_agent") == (
+            "nvidia/Nemotron-Agentic-v1",
+            "interactive_agent",
+        )
+
+    def test_trailing_colon_without_split_falls_back(self) -> None:
+        assert parse_dataset_spec("org/repo:") == ("org/repo:", "train")
+
+
+class TestResolveDatasetSplit:
+    def test_keeps_train_when_present(self) -> None:
+        with patch("datasets.get_dataset_split_names", return_value=["train"]):
+            assert resolve_dataset_split("org/repo") == "train"
+
+    def test_falls_back_when_train_absent(self) -> None:
+        # Nemotron-Agentic exposes named subsets, not "train".
+        with patch(
+            "datasets.get_dataset_split_names",
+            return_value=["interactive_agent", "tool_calling"],
+        ):
+            assert (
+                resolve_dataset_split("nvidia/Nemotron-Agentic-v1")
+                == "interactive_agent"
+            )
+
+    def test_returns_preferred_when_enumeration_fails(self) -> None:
+        with patch(
+            "datasets.get_dataset_split_names", side_effect=Exception("offline")
+        ):
+            assert resolve_dataset_split("org/repo", "train") == "train"

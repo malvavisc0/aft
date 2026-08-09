@@ -51,7 +51,11 @@ class QuantizeConfig:
     bits: int = 4
     #: 128 is what vLLM's ``gptq_marlin`` kernel expects (or -1 per-column).
     group_size: int = 128
-    desc_act: bool = False
+    #: Activation-order reorders columns by activation magnitude before
+    #: quantizing, which noticeably improves accuracy on models with outlier
+    #: activations (most instruct/reasoning fine-tunes). It is slower to
+    #: quantize but the artifact is permanent — prefer quality by default.
+    desc_act: bool = True
     format: str = "gptq"  # "gptq" | "fp8"
     calibration_dataset: str = "fineweb-edu"
     n_calibration_samples: int = 128

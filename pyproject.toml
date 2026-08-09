@@ -26,6 +26,7 @@ dependencies = [
     "typer",
     "rich",
     "loguru",
+    "basedpyright>=1.39.9",
 ]
 
 [project.scripts]
@@ -59,6 +60,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+    "basedpyright"
 ]
 
 [tool.pytest.ini_options]

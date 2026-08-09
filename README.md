@@ -11,7 +11,10 @@ publishes the result to HuggingFace Hub — all from a single CLI.
 - **QLoRA SFT** — 4-bit NF4 training with LoRA adapters on all attention + MLP layers
 - **Automatic parameter tuning** — detects your GPU and model size, then recommends rank, learning rate, batch size, and sequence length
 - **Dataset cleaning** — whitespace normalization, special-character filtering, token-length bounds, language detection, and deduplication
+- **Conversational datasets** — auto-flattens chat-format rows (`messages`/`conversations`) from any schema (OpenAI `role`/`content`, ShareGPT `from`/`value`, OpenAI multi-part content blocks)
 - **Quantization** — GPTQ Int4/Int8 and FP8 quantization via GPTQModel, producing vLLM-ready checkpoints
+- **Domain-matched calibration** — code, agentic, and general-web calibration presets; arbitrary HF datasets accepted; activation order on by default for higher fidelity
+- **Clean artifacts** — strips gptqmodel's leaked local temp paths and spurious top-level `rope_parameters` from saved configs
 - **Hub integration** — push quantized models directly to HuggingFace Hub
 - **Modular pipeline** — run the full stack or individual phases (train, merge, quantize, push)
 - **Resumable runs** — automatically detects completed phases and skips them with `--resume`
@@ -61,6 +64,26 @@ aft push \
 vllm serve ./models/my-run/gptq-int4 --quantization gptq_marlin
 ```
 
+### Quantize a base model (no fine-tuning)
+
+For models too large to train or merge locally, quantize directly:
+
+```bash
+# Download the source model once
+hf download empero-ai/Qwable-9B-Claude-Fable-5 --local-dir ./models/qwable-src
+
+# Quantize with domain-matched calibration (agentic tool-use traces)
+aft quantize \
+    --model ./models/qwable-src \
+    --output ./models/qwable-gptq-int4 \
+    --calibration nemotron-agentic \
+    --calibration-samples 256 \
+    --calibration-seq-len 4096
+
+# Serve
+vllm serve ./models/qwable-gptq-int4 --quantization gptq_marlin
+```
+
 ## Commands
 
 ### `aft recommend`
@@ -94,6 +117,14 @@ aft run \
 
 # After FP8 quantization, serve with vLLM:
 # vllm serve ./models/my-fp8-run/fp8 --quantization fp8
+
+# Agentic model: train on Nemotron tool-use traces, calibrate on the same domain
+aft run \
+    --model Qwen/Qwen2.5-7B \
+    --dataset nvidia/Nemotron-Agentic-v1:interactive_agent \
+    --calibration nemotron-agentic \
+    --run-name my-agentic-run \
+    --output ./models
 ```
 
 #### Training options
@@ -128,7 +159,11 @@ aft run \
 |------|---------|-------------|
 | `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
 | `--gptq-group-size` | `128` | GPTQ group size (int4/int8 only) |
-| `--calibration` | `fineweb-edu` | Calibration dataset (`fineweb-edu` or path to JSONL) |
+| `--desc-act` / `--no-desc-act` | `--desc-act` | Activation order — slower to quantize, higher fidelity (int4/int8 only) |
+| `--calibration` | `fineweb-edu` | Calibration source: alias (`fineweb-edu`, `starcoder`, `nemotron-agentic`), HF repo id, or JSONL path |
+| `--calibration-samples` | `128` | Number of calibration samples |
+| `--calibration-seq-len` | `2048` | Calibration sequence length |
+| `--no-chat-template` | off | Calibrate on raw text instead of the model's chat template |
 | `--target-modules` | auto-detected | Comma-separated LoRA target modules. Discovered from the model when omitted |
 | `--revision` | latest | Pin the base model to a specific git revision |
 
@@ -137,7 +172,7 @@ aft run \
 | Flag | Description |
 |------|-------------|
 | `--skip-finetune` | Skip SFT, merge + quantize an existing adapter |
-| `--no-finetune` | Quantize the base model directly — no SFT, no adapter, no merge |
+| `--base-model-only` | Quantize the base model directly — no SFT, no adapter, no merge |
 | `--skip-quantize` | Stop after merge (produces fp16 model) |
 | `--resume` | Auto-detect completed phases and skip them |
 
@@ -181,13 +216,13 @@ aft quantize \
 |------|---------|-------------|
 | `--quant-type` | `int4` | Quantization type: `int4`, `int8`, or `fp8` |
 | `--group-size` | `128` | GPTQ group size (int4/int8 only). Must be 128, 64, 32, or -1 |
-| `--desc-act` | off | Use activation order — slower, better quality (int4/int8 only) |
+| `--desc-act` / `--no-desc-act` | `--desc-act` | Activation order — slower to quantize, higher fidelity (int4/int8 only) |
+| `--calibration` | `fineweb-edu` | Calibration source: alias (`fineweb-edu`, `starcoder`, `nemotron-agentic`), HF repo id, or JSONL path |
+| `--n-calibration-samples` | `128` | Number of calibration samples |
+| `--calibration-seq-len` | `2048` | Calibration sequence length |
 | `--no-chat-template` | off | Calibrate on raw text instead of the model's chat template |
 | `--allow-partial-coverage` | off | Permit layers to be left unquantized instead of failing |
 | `--revision` | latest | Pin the model to a specific git revision |
-| `--calibration` | `fineweb-edu` | Calibration dataset |
-| `--n-calibration-samples` | `128` | Number of calibration samples |
-| `--calibration-seq-len` | `2048` | Calibration sequence length |
 | `--trust-remote-code` | off | Allow loading models with custom code |
 
 ### `aft push`
@@ -210,18 +245,49 @@ aft push \
 
 ## Supported Datasets
 
-`aft` auto-detects the dataset format when loading from HuggingFace:
+`aft` auto-detects the dataset format when loading from HuggingFace and
+flattens each row into a single text string:
 
-| Column | Handling |
-|--------|----------|
-| `text` | Used directly as training text |
-| `conversations` | Chat-format rows flattened to `role: content` lines |
-| Other | Falls back to the first column |
+| Column(s) | Handling |
+|-----------|----------|
+| `text`, `content`, `code`, `body` | Used directly as training/calibration text |
+| `messages` | OpenAI/HF chat format — `[{role, content}]` flattened to `role: content` lines (supports multi-part `content` blocks) |
+| `conversations` | ShareGPT format — `[{from, value}]` flattened the same way |
+
+Datasets that expose named splits instead of `train` (e.g.
+`nvidia/Nemotron-Agentic-v1` has `interactive_agent` / `tool_calling`) are
+auto-resolved: `aft` queries the available splits and falls back to the first
+one when `train` is absent. Append `:split` to pick a specific subset:
+
+```bash
+aft run --dataset nvidia/Nemotron-Agentic-v1:tool_calling --model ... --run-name ...
+```
 
 Multiple datasets can be passed as a comma-separated list:
 
 ```bash
 aft run --dataset teknium/OpenHermes-2.5,Open-Orca/SlimOrca --model ... --run-name ...
+```
+
+### Calibration presets
+
+`--calibration` accepts short aliases, arbitrary HF repo ids, or a local JSONL
+file. Aliases map to a curated registry with the right text field and split:
+
+| Alias | Dataset | Field | Notes |
+|-------|---------|-------|-------|
+| `fineweb-edu` | `HuggingFaceFW/fineweb-edu` | `text` | General educational web (default) |
+| `fineweb` | `HuggingFaceFW/fineweb` | `text` | General web |
+| `c4` | `allenai/c4` | `text` | General web |
+| `starcoder` | `bigcode/starcoderdata` | `content` | Code — gated, streams the `python` subdir |
+| `nemotron-agentic` | `nvidia/Nemotron-Agentic-v1` | `messages` | Agentic tool-use chat — `interactive_agent` split |
+
+For a coding/agentic model, match the calibration distribution to the serving
+traffic rather than defaulting to general web text:
+
+```bash
+aft quantize --model ./merged --output ./gptq \
+    --calibration nemotron-agentic --calibration-samples 256 --calibration-seq-len 4096
 ```
 
 ## Supported Architectures
@@ -374,7 +440,8 @@ Full 16-bit fine-tuning of a 7B model requires ~14 GB of VRAM just for the model
 
 GPTQ was chosen because:
 - **vLLM integration** — vLLM has first-class support for GPTQ via the `gptq_marlin` kernel, giving near-native inference speed.
-- **Calibration flexibility** — GPTQ supports arbitrary calibration datasets (default: wikitext-2), allowing you to tune quantization quality for your domain.
+- **Calibration flexibility** — GPTQ supports arbitrary calibration datasets (default: `fineweb-edu`), and `aft` ships domain-matched presets (code, agentic) so you can tune quantization quality for your model's serving traffic.
+- **Activation order by default** — `--desc-act` is on by default, reordering weight columns by activation magnitude before quantizing for measurably lower loss on instruct/reasoning fine-tunes. The cost is one-time slower quantization; the artifact is permanent.
 - **Active development** — GPTQModel (used by this tool) is actively maintained with broad model architecture support.
 
 ### Why these LoRA target modules?
@@ -400,12 +467,13 @@ The `0.55` factor accounts for the NF4 quantization (4 bits/param) plus safetens
 
 ## Known Limitations
 
-- **Merging requires the whole model in RAM** — `merge_adapter` materializes the full unquantized model on CPU, so a 35B/65 GiB checkpoint needs ≥65 GiB of system RAM. `aft` warns when the checkpoint clearly won't fit; for large models use `--no-finetune` to quantize the base model directly.
+- **Merging requires the whole model in RAM** — `merge_adapter` materializes the full unquantized model on CPU, so a 35B/65 GiB checkpoint needs ≥65 GiB of system RAM. `aft` warns when the checkpoint clearly won't fit; for large models use `--base-model-only` to quantize the base model directly.
 - **No layer-sequential or CPU-offload quantization** — quantization assumes the model can be loaded on the available hardware.
 - **Text-only calibration** — even for multimodal models; the vision path is not calibrated.
 - **Single-GPU training only** — No FSDP or DeepSpeed support. Multi-GPU is limited to data-parallel via `device_map="auto"`.
 - **No eval/validation during training** — Training runs without a validation set. Metrics are training loss only.
 - **No early stopping** — The pipeline trains for the specified number of epochs without monitoring validation loss.
+- **Gated datasets need manual setup** — presets like `starcoder` require accepting access terms on the dataset's HF page and setting `HF_TOKEN`. Non-gated presets (`fineweb-edu`, `nemotron-agentic`) work out of the box.
 
 ## Development
 

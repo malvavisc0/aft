@@ -48,7 +48,13 @@ def train(config: TrainConfig) -> Path:
     from transformers import BitsAndBytesConfig
     from trl import SFTConfig, SFTTrainer
 
-    from aft.cleaning import clean_dataset
+    from aft.cleaning import (
+        clean_dataset,
+        flatten_row_to_text,
+        parse_dataset_spec,
+        resolve_dataset_split,
+        supported_text_columns,
+    )
 
     silence_noisy_loggers()
 
@@ -108,16 +114,29 @@ def train(config: TrainConfig) -> Path:
 
     console.print(f"[cyan]Loading datasets: {config.datasets}[/cyan]")
     all_texts: list[str] = []
-    for ds_id in config.datasets:
-        ds = hf_datasets.load_dataset(ds_id, split="train", token=hf_token)
-        if "text" in ds.column_names:
-            all_texts.extend(ds["text"])
-        elif "conversations" in ds.column_names:
-            for row in ds:
-                parts = [f"{m['role']}: {m['content']}" for m in row["conversations"]]
-                all_texts.append("\n".join(parts))
-        else:
-            raise AftError(f"Dataset {ds_id} has no text/conversations column.")
+    for ds_spec in config.datasets:
+        ds_id, requested_split = parse_dataset_spec(ds_spec)
+        split = resolve_dataset_split(ds_id, requested_split, token=hf_token)
+        ds = hf_datasets.load_dataset(ds_id, split=split, token=hf_token)
+        # Fast-fail on an unsupported schema before iterating.
+        supported = {
+            "text",
+            "content",
+            "code",
+            "body",
+            "messages",
+            "conversations",
+        }
+        if not (set(ds.column_names) & supported):
+            raise AftError(
+                f"Dataset {ds_id} has no supported text column.\n"
+                f"  Expected {supported_text_columns()}.\n"
+                f"  Columns found: {', '.join(ds.column_names)}"
+            )
+        for row in ds:
+            text = flatten_row_to_text(row)
+            if text:
+                all_texts.append(text)
 
     dataset = hf_datasets.Dataset.from_dict({"text": all_texts})
     if config.max_samples:

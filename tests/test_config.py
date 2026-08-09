@@ -57,7 +57,9 @@ class TestQuantizeConfigDefaults:
         assert cfg.bits == 4
         # 128 is the group size vLLM's gptq_marlin kernel expects.
         assert cfg.group_size == 128
-        assert cfg.desc_act is False
+        # Activation order is the higher-quality path; the quantization cost
+        # is one-time but the artifact is permanent.
+        assert cfg.desc_act is True
         assert cfg.calibration_dataset == "fineweb-edu"
         assert cfg.n_calibration_samples == 128
         assert cfg.calibration_seq_len == 2048

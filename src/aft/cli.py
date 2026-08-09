@@ -346,7 +346,12 @@ def run_cmd(
     model: Annotated[str, typer.Option("--model", help="Base model HF repo ID.")],
     dataset: Annotated[
         str,
-        typer.Option("--dataset", help="HF dataset repo ID(s), comma-separated."),
+        typer.Option(
+            "--dataset",
+            help="HF dataset repo ID(s), comma-separated. Append ':split'"
+            " to pick a named subset (e.g."
+            " nvidia/Nemotron-Agentic-v1:interactive_agent).",
+        ),
     ],
     run_name: Annotated[
         str, typer.Option("--run-name", help="Run name for output subdirectory.")
@@ -389,9 +394,34 @@ def run_cmd(
         ),
     ] = "int4",
     gptq_group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
+    desc_act: Annotated[
+        bool,
+        typer.Option(
+            "--desc-act/--no-desc-act",
+            help="Activation order: slower to quantize, higher fidelity (default).",
+        ),
+    ] = True,
     calibration: Annotated[
-        str, typer.Option(help="'fineweb-edu' or path to JSONL.")
+        str,
+        typer.Option(
+            help="Calibration source: 'fineweb-edu', 'starcoder' (gated,"
+            " coding), 'nemotron-agentic' (agentic chat), a HF repo id,"
+            " or a path to a JSONL file."
+        ),
     ] = "fineweb-edu",
+    calibration_samples: Annotated[
+        int, typer.Option(help="Number of calibration samples.")
+    ] = 128,
+    calibration_seq_len: Annotated[
+        int, typer.Option(help="Calibration sequence length.")
+    ] = 2048,
+    no_chat_template: Annotated[
+        bool,
+        typer.Option(
+            "--no-chat-template",
+            help="Calibrate on raw text instead of applying the model's chat template.",
+        ),
+    ] = False,
     target_modules: Annotated[
         str | None,
         typer.Option(
@@ -453,9 +483,13 @@ def run_cmd(
         bits=q_bits,
         format=q_format,
         group_size=gptq_group_size,
+        desc_act=desc_act,
         calibration_dataset=calibration,
+        n_calibration_samples=calibration_samples,
+        calibration_seq_len=calibration_seq_len,
         trust_remote_code=trust_remote_code,
         revision=revision,
+        use_chat_template=not no_chat_template,
     )
 
     # ── Direct base-model quantization (no SFT, no merge) ──────────────
@@ -606,10 +640,19 @@ def quantize_cmd(
     ] = "int4",
     group_size: Annotated[int, typer.Option(help="GPTQ group size.")] = 128,
     desc_act: Annotated[
-        bool, typer.Option("--desc-act", help="Use activation order (slower, better).")
-    ] = False,
+        bool,
+        typer.Option(
+            "--desc-act/--no-desc-act",
+            help="Activation order: slower to quantize, higher fidelity (default).",
+        ),
+    ] = True,
     calibration: Annotated[
-        str, typer.Option(help="'fineweb-edu' or path to JSONL.")
+        str,
+        typer.Option(
+            help="Calibration source: 'fineweb-edu', 'starcoder' (gated,"
+            " coding), 'nemotron-agentic' (agentic chat), a HF repo id,"
+            " or a path to a JSONL file."
+        ),
     ] = "fineweb-edu",
     n_calibration_samples: Annotated[
         int, typer.Option(help="Number of calibration samples.")
