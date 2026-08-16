@@ -9,6 +9,7 @@ publishes the result to HuggingFace Hub — all from a single CLI.
 ## Features
 
 - **QLoRA SFT** — 4-bit NF4 training with LoRA adapters on all attention + MLP layers
+- **Structured chat training** — `--format messages` trains on chat rows with `tool_calls` and `reasoning_content`, with per-turn loss masking rendered through your own chat template (`--chat-template`)
 - **Automatic parameter tuning** — detects your GPU and model size, then recommends rank, learning rate, batch size, and sequence length
 - **Dataset cleaning** — whitespace normalization, special-character filtering, token-length bounds, language detection, and deduplication
 - **Conversational datasets** — auto-flattens chat-format rows (`messages`/`conversations`) from any schema (OpenAI `role`/`content`, ShareGPT `from`/`value`, OpenAI multi-part content blocks)
@@ -23,7 +24,8 @@ publishes the result to HuggingFace Hub — all from a single CLI.
 
 ## Requirements
 
-- Python ≥ 3.14
+- Python ≥ 3.12, < 3.14 — **3.14 is not supported**: its forkserver
+  multiprocessing default crashes DataLoader workers after CUDA init
 - NVIDIA GPU with CUDA support
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
@@ -164,6 +166,7 @@ aft run \
 | `--calibration-samples` | `128` | Number of calibration samples |
 | `--calibration-seq-len` | `2048` | Calibration sequence length |
 | `--no-chat-template` | off | Calibrate on raw text instead of the model's chat template |
+| `--chat-template` | tokenizer's | Path to a local `.jinja` chat template — overrides the tokenizer's bundled one for both training (`--format messages`) and calibration rendering. Use the same file you will pass to vLLM at serve time, so train/calibrate/serve all match |
 | `--target-modules` | auto-detected | Comma-separated LoRA target modules. Discovered from the model when omitted |
 | `--revision` | latest | Pin the base model to a specific git revision |
 
@@ -221,6 +224,7 @@ aft quantize \
 | `--n-calibration-samples` | `128` | Number of calibration samples |
 | `--calibration-seq-len` | `2048` | Calibration sequence length |
 | `--no-chat-template` | off | Calibrate on raw text instead of the model's chat template |
+| `--chat-template` | tokenizer's | Path to a local `.jinja` chat template — overrides the tokenizer's bundled one when rendering calibration texts. Use the same file you will serve with |
 | `--allow-partial-coverage` | off | Permit layers to be left unquantized instead of failing |
 | `--revision` | latest | Pin the model to a specific git revision |
 | `--trust-remote-code` | off | Allow loading models with custom code |
@@ -244,6 +248,33 @@ aft push \
 | `--message` | `"Upload GPTQ quantized model"` | Commit message |
 
 ## Supported Datasets
+
+### Structured chat (`--format messages`)
+
+For agentic/tool-calling SFT, `aft` consumes a `messages` column of
+`{role, content}` dicts — assistant turns may carry `tool_calls`
+(`function.arguments` as a **dict**) and `reasoning_content`; tool results
+use `role: "tool"` with `tool_call_id`. Each row's tool definitions travel
+in a sibling `tools` column and are passed to the template's `tools=` kwarg.
+Tokenization renders through the template given by `--chat-template`
+(required), and labels are built by turn-diff so loss covers assistant spans
+(reasoning + content + tool calls) and masks system/user/tool context:
+
+```bash
+aft run \
+    --model unsloth/Qwen3.5-9B \
+    --dataset myorg/my-agent-data \
+    --format messages \
+    --chat-template experiments/qwen3.5/chat_template.jinja \
+    --mask-strategy full \
+    --target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,out_proj,in_proj_qkv,in_proj_z \
+    --run-name my-agent --output ./models
+```
+
+`--mask-strategy full` labels every assistant span (full trajectories);
+`cumulative` labels only the final one.
+
+### Flat text (default)
 
 `aft` auto-detects the dataset format when loading from HuggingFace and
 flattens each row into a single text string:
@@ -290,6 +321,13 @@ aft quantize --model ./merged --output ./gptq \
     --calibration nemotron-agentic --calibration-samples 256 --calibration-seq-len 4096
 ```
 
+Calibration texts are rendered through the chat template before tokenization
+(unless `--no-chat-template`), because GPTQ measures activation statistics —
+they must match what the model sees at serving time. If you serve with a
+custom chat template, pass the same file via `--chat-template` here; the
+tokenizer's bundled template is often a minimal one that differs from what
+you actually serve.
+
 ## Supported Architectures
 
 LoRA target modules are **discovered from the loaded model**, by intersecting its
@@ -298,7 +336,7 @@ actual linear layers with a set of known projection names (`q/k/v/o_proj`,
 tested on:
 
 - **Llama** family (Llama 2, Llama 3, Code Llama)
-- **Qwen** family (Qwen 2, Qwen 2.5)
+- **Qwen** family (Qwen 2, Qwen 2.5, Qwen 3.5 hybrid — see Known Limitations)
 - **Mistral** / Mixtral
 - **Gemma** / Gemma 2
 
@@ -474,6 +512,8 @@ The `0.55` factor accounts for the NF4 quantization (4 bits/param) plus safetens
 - **No eval/validation during training** — Training runs without a validation set. Metrics are training loss only.
 - **No early stopping** — The pipeline trains for the specified number of epochs without monitoring validation loss.
 - **Gated datasets need manual setup** — presets like `starcoder` require accepting access terms on the dataset's HF page and setting `HF_TOKEN`. Non-gated presets (`fineweb-edu`, `nemotron-agentic`) work out of the box.
+- **fla and gptqmodel conflict in one process** — on hybrid-arch models (e.g. `qwen3_5` GatedDeltaNet), pre-importing `fla.ops` gives fused Triton kernels for training, but gptqmodel's Triton autotuner patch then crashes quantization. Train (fla imported) and quantize (no fla) as separate processes.
+- **Hybrid-arch LoRA discovery under-covers** — on `qwen3_5`-style models the default discovery misses the GatedDeltaNet `in_proj_qkv`/`in_proj_z` projections; pass `--target-modules` explicitly (see `EXPERIMENT.md`).
 
 ## Development
 
