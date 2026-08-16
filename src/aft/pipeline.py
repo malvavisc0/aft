@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from loguru import logger
@@ -351,6 +351,30 @@ def merge_adapter(
     return output
 
 
+def _patch_fp8_device_validation() -> None:
+    """Work around gptqmodel 7.3.4's FP8 weight-only device assertion.
+
+    ``BaseQuantLinear.validate_device`` asserts ``isinstance(device, DEVICE)``
+    (an enum), but the FP8 weight-only finalize path passes a raw
+    ``torch.device``, crashing FP8 quantization on any CUDA host. Coerce
+    ``torch.device`` to the matching ``DEVICE`` member before validation.
+    """
+    from gptqmodel.models._const import DEVICE
+    from gptqmodel.nn_modules.qlinear import BaseQuantLinear
+
+    original = BaseQuantLinear.validate_device.__func__
+
+    def coercing(cls: Any, device: Any) -> None:
+        if isinstance(device, torch.device):
+            device = DEVICE(device.type)
+        original(cls, device)
+
+    # Monkeypatching a third-party classmethod: basedpyright can't model the
+    # assignment, and the bundled gptqmodel stubs declare the attribute's
+    # original signature. Cast the class to Any to make the patch explicit.
+    cast(Any, BaseQuantLinear).validate_device = classmethod(coercing)
+
+
 def quantize(
     model_path: Path, output: Path, config: QuantizeConfig, *, token: str | None = None
 ) -> Path:
@@ -366,6 +390,8 @@ def quantize(
     if config.calibration_dataset not in _HF_CALIBRATION_DATASETS:
         config.calibration_dataset = str(Path(config.calibration_dataset).resolve())
     is_fp8, quant_label, vllm_quant_arg = validate_quant_config(config)
+    if is_fp8:
+        _patch_fp8_device_validation()
     prev_cwd = os.getcwd()
     try:
         with tempfile.TemporaryDirectory(prefix="gptq_") as tmp_dir:
