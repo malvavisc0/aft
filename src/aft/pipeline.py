@@ -22,6 +22,7 @@ from aft.cleaning import (
     supported_text_columns,
 )
 from aft.config import QuantizeConfig, TrainConfig
+from aft.dataprep import stack_messages, tokenize_dataset
 from aft.errors import AftError
 from aft.model_utils import (
     auto_model_class,
@@ -75,14 +76,107 @@ def _load_training_texts(datasets: list[str], hf_token: str | None) -> list[str]
     return all_texts
 
 
+def _load_training_messages(
+    datasets: list[str], hf_token: str | None
+) -> dict[str, list[Any]]:
+    """Load every dataset's structured rows into ``messages``/``tools`` columns."""
+    import datasets as hf_datasets
+
+    console.print(f"[cyan]Loading message datasets: {datasets}[/cyan]")
+    columns: dict[str, list[Any]] = {"messages": [], "tools": []}
+    for ds_spec in datasets:
+        ds_id, requested_split = parse_dataset_spec(ds_spec)
+        split = resolve_dataset_split(ds_id, requested_split, token=hf_token)
+        ds = hf_datasets.load_dataset(ds_id, split=split, token=hf_token)
+        if "messages" not in ds.column_names and "conversations" not in ds.column_names:
+            raise AftError(
+                f"Dataset {ds_id} has no messages column for format='messages'.\n"
+                f"  Columns found: {', '.join(ds.column_names)}"
+            )
+        for row in stack_messages(ds):
+            columns["messages"].append(row["messages"])
+            columns["tools"].append(row["tools"])
+    return columns
+
+
+def _load_chat_template(config: TrainConfig) -> str:
+    """Return the local chat template content, validating it exists."""
+    if not config.chat_template:
+        raise AftError(
+            "format='messages' requires --chat-template pointing at the local"
+            " v22 .jinja file."
+        )
+    path = Path(config.chat_template)
+    if not path.is_file():
+        raise AftError(f"Chat template file not found: {path}")
+    return path.read_text()
+
+
+def _build_train_dataset(
+    config: TrainConfig, tokenizer: Any, hf_token: str | None
+) -> tuple[Any, dict[str, Any]]:
+    """Build the train dataset and the dataset-specific ``SFTConfig`` kwargs."""
+    import datasets as hf_datasets
+
+    from aft.cleaning import clean_dataset
+
+    if config.format not in ("text", "messages"):
+        raise AftError(
+            f"Unknown dataset format: {config.format!r}. Expected 'text' or 'messages'."
+        )
+
+    if config.format == "messages":
+        if config.clean:
+            raise AftError(
+                "format='messages' does not support --clean yet; the text"
+                " path is the structured-clean route."
+            )
+        chat_template = _load_chat_template(config)
+        columns = _load_training_messages(config.datasets, hf_token)
+        dataset = hf_datasets.Dataset.from_dict(columns)
+        if config.max_samples:
+            dataset = dataset.select(range(min(config.max_samples, len(dataset))))
+        dataset = tokenize_dataset(
+            dataset,
+            tokenizer,
+            max_seq_len=config.max_seq_len,
+            mask_strategy=config.mask_strategy,
+            chat_template=chat_template,
+            enable_thinking=config.enable_thinking,
+            reasoning_effort=config.reasoning_effort,
+            tool_call_format=config.tool_call_format,
+        )
+        # Rows are pre-tokenized and pre-truncated by dataprep: trl must not
+        # re-truncate (its max_length default would silently cut to 1024).
+        return dataset, {"max_length": None}
+
+    all_texts = _load_training_texts(config.datasets, hf_token)
+
+    dataset = hf_datasets.Dataset.from_dict({"text": all_texts})
+    if config.max_samples:
+        dataset = dataset.select(range(min(config.max_samples, len(dataset))))
+
+    if config.clean:
+        dataset = clean_dataset(
+            dataset,
+            tokenizer,
+            dedup=config.dedup,
+            min_tokens=config.min_tokens,
+            max_tokens=config.max_tokens or config.max_seq_len,
+            languages=config.languages,
+            max_special_ratio=config.max_special_ratio,
+        )
+    return dataset, {
+        "dataset_text_field": "text",
+        "max_length": config.max_seq_len,
+    }
+
+
 def train(config: TrainConfig) -> Path:
     """Run QLoRA supervised fine-tuning."""
-    import datasets as hf_datasets
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import BitsAndBytesConfig
     from trl import SFTConfig, SFTTrainer
-
-    from aft.cleaning import clean_dataset
 
     silence_noisy_loggers()
 
@@ -140,22 +234,7 @@ def train(config: TrainConfig) -> Path:
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    all_texts = _load_training_texts(config.datasets, hf_token)
-
-    dataset = hf_datasets.Dataset.from_dict({"text": all_texts})
-    if config.max_samples:
-        dataset = dataset.select(range(min(config.max_samples, len(dataset))))
-
-    if config.clean:
-        dataset = clean_dataset(
-            dataset,
-            tokenizer,
-            dedup=config.dedup,
-            min_tokens=config.min_tokens,
-            max_tokens=config.max_tokens or config.max_seq_len,
-            languages=config.languages,
-            max_special_ratio=config.max_special_ratio,
-        )
+    dataset, sft_dataset_kwargs = _build_train_dataset(config, tokenizer, hf_token)
 
     _total_steps = max(
         1,
@@ -183,9 +262,9 @@ def train(config: TrainConfig) -> Path:
         report_to="none",
         run_name=config.run_name,
         train_sampling_strategy="group_by_length",
-        dataloader_num_workers=4,
-        dataset_text_field="text",
-        max_length=config.max_seq_len,
+        dataloader_num_workers=0,
+        packing=False,
+        **sft_dataset_kwargs,
     )
     trainer = SFTTrainer(
         model=model, processing_class=tokenizer, train_dataset=dataset, args=args

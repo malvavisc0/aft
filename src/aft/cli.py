@@ -59,6 +59,7 @@ def _build_quant_config(
     n_calibration_samples: int = 128,
     calibration_seq_len: int = 2048,
     use_chat_template: bool = True,
+    chat_template: str | None = None,
     strict_layer_coverage: bool = True,
 ) -> "QuantizeConfig":
     """Map CLI args to a QuantizeConfig (shared by run_cmd and quantize_cmd)."""
@@ -75,6 +76,7 @@ def _build_quant_config(
         trust_remote_code=trust_remote_code,
         revision=revision,
         use_chat_template=use_chat_template,
+        chat_template=chat_template,
         strict_layer_coverage=strict_layer_coverage,
     )
 
@@ -399,6 +401,12 @@ def _build_train_config(
     trust_remote_code: bool,
     revision: str | None,
     target_module_list: list[str] | None,
+    format: str,
+    mask_strategy: str,
+    chat_template: str | None,
+    enable_thinking: bool,
+    reasoning_effort: str,
+    tool_call_format: str,
 ) -> "TrainConfig":
     from aft.config import LORA_ALPHA_MULTIPLIER, TrainConfig
 
@@ -427,6 +435,12 @@ def _build_train_config(
         trust_remote_code=trust_remote_code,
         revision=revision,
         target_modules=target_module_list,
+        format=format,
+        mask_strategy=mask_strategy,
+        chat_template=chat_template,
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
+        tool_call_format=tool_call_format,
     )
 
 
@@ -566,6 +580,40 @@ def run_cmd(
             " from the model when omitted.",
         ),
     ] = None,
+    format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Dataset format: 'text' (default, backwards-compatible) or"
+            " 'messages' (structured chat with tool_calls/reasoning).",
+        ),
+    ] = "text",
+    mask_strategy: Annotated[
+        str,
+        typer.Option(
+            "--mask-strategy",
+            help="Label masking for --format messages: 'full' (label every"
+            " assistant span) or 'cumulative' (label only the final span).",
+        ),
+    ] = "full",
+    chat_template: Annotated[
+        str | None,
+        typer.Option(
+            "--chat-template",
+            help="Path to the local v22 chat template .jinja (required for"
+            " --format messages; overrides the tokenizer's bundled one).",
+        ),
+    ] = None,
+    enable_thinking: Annotated[
+        bool,
+        typer.Option("--enable-thinking/--no-enable-thinking"),
+    ] = True,
+    reasoning_effort: Annotated[
+        str, typer.Option(help="Reasoning effort: xhigh, medium, or low.")
+    ] = "xhigh",
+    tool_call_format: Annotated[
+        str, typer.Option(help="Tool call format: 'xml' (default) or 'json'.")
+    ] = "xml",
     revision: Annotated[
         str | None,
         typer.Option("--revision", help="Pin the base model to a git revision."),
@@ -613,6 +661,7 @@ def run_cmd(
         trust_remote_code=trust_remote_code,
         revision=revision,
         use_chat_template=not no_chat_template,
+        chat_template=chat_template,
     )
 
     # ── Direct base-model quantization (no SFT, no merge) ──────────────
@@ -632,9 +681,12 @@ def run_cmd(
         console.print(f"[bold green]✓ {q_label} → {gptq_dir}[/bold green]")
         return
 
-    skip_finetune, skip_merge, skip_quantize = _resolve_resume_skips(
+    resume_ft, resume_merge, resume_quant = _resolve_resume_skips(
         resume, adapter_dir, merged_dir, gptq_dir, model, quant_cfg, revision
     )
+    skip_finetune = skip_finetune or resume_ft
+    skip_merge = resume_merge
+    skip_quantize = skip_quantize or resume_quant
 
     try:
         _step_bar(0, steps)
@@ -662,6 +714,12 @@ def run_cmd(
                 trust_remote_code=trust_remote_code,
                 revision=revision,
                 target_module_list=target_module_list,
+                format=format,
+                mask_strategy=mask_strategy,
+                chat_template=chat_template,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                tool_call_format=tool_call_format,
             )
             train(cfg)
         elif not adapter_dir.exists():
@@ -759,6 +817,14 @@ def quantize_cmd(
             help="Permit layers to be left unquantized instead of failing.",
         ),
     ] = False,
+    chat_template: Annotated[
+        str | None,
+        typer.Option(
+            "--chat-template",
+            help="Path to a local .jinja chat template used to render"
+            " calibration texts (overrides the tokenizer's bundled one).",
+        ),
+    ] = None,
     revision: Annotated[
         str | None,
         typer.Option("--revision", help="Pin the model to a git revision."),
@@ -791,6 +857,7 @@ def quantize_cmd(
         trust_remote_code=trust_remote_code,
         revision=revision,
         use_chat_template=not no_chat_template,
+        chat_template=chat_template,
         strict_layer_coverage=not allow_partial_coverage,
     )
     try:

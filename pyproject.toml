@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "Standalone fine-tuning and GPTQ quantization pipeline for instruction-following models."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 authors = [
     { name = "Malvavisc0" },
 ]
@@ -18,6 +18,8 @@ dependencies = [
     "accelerate",
     "datasets",
     "gptqmodel @ git+https://github.com/ModelCloud/GPTQModel.git",
+    "optimum",
+    "fla-core",
     "huggingface-hub",
     "logbar",
     "tokenicer",
@@ -26,7 +28,6 @@ dependencies = [
     "typer",
     "rich",
     "loguru",
-    "basedpyright>=1.39.9",
 ]
 
 [project.scripts]
@@ -47,7 +48,7 @@ no-build-isolation-package = ["gptqmodel"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py314"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

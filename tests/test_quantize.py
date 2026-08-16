@@ -15,6 +15,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from aft.config import QuantizeConfig
+from aft.errors import AftError
 from aft.quantize import sanitize_saved_config
 
 
@@ -118,3 +122,49 @@ class TestSanitizeLeakedPaths:
     def test_missing_files_are_noop(self, tmp_path: Path) -> None:
         # Must not raise when the config files were never written.
         sanitize_saved_config(tmp_path)
+
+
+class TestChatTemplateOverride:
+    def _load(self, tmp_path: Path, config: QuantizeConfig) -> Any:
+        """Run load_model_for_quantization with heavy deps stubbed out."""
+        from unittest.mock import MagicMock, patch
+
+        import aft.quantize as aq
+
+        tokenizer = MagicMock()
+        tokenizer.chat_template = "bundled"
+        load_inputs = MagicMock(
+            return_value=(MagicMock(), False, MagicMock(), tokenizer)
+        )
+        gptq = MagicMock()
+        gptq.GPTQModel.from_pretrained.return_value = MagicMock()
+        with (
+            patch.object(aq, "load_model_inputs", load_inputs),
+            patch.object(aq, "get_calibration_data", return_value=[]),
+            patch.object(aq, "resolve_dtype", return_value="bfloat16"),
+            patch.dict("sys.modules", {"gptqmodel": gptq}),
+        ):
+            from aft.quantize import load_model_for_quantization
+
+            load_model_for_quantization(tmp_path, config, is_fp8=False, hf_token=None)
+        return tokenizer
+
+    def test_override_replaces_bundled_template(self, tmp_path: Path) -> None:
+        template = tmp_path / "tpl.jinja"
+        template.write_text("{{ local v22 }}")
+        config = QuantizeConfig(chat_template=str(template))
+
+        tokenizer = self._load(tmp_path, config)
+
+        assert tokenizer.chat_template == "{{ local v22 }}"
+
+    def test_missing_template_file_fails_fast(self, tmp_path: Path) -> None:
+        config = QuantizeConfig(chat_template=str(tmp_path / "nope.jinja"))
+
+        with pytest.raises(AftError, match="Chat template file not found"):
+            self._load(tmp_path, config)
+
+    def test_no_override_keeps_bundled_template(self, tmp_path: Path) -> None:
+        tokenizer = self._load(tmp_path, QuantizeConfig())
+
+        assert tokenizer.chat_template == "bundled"

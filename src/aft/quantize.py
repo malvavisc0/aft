@@ -535,6 +535,13 @@ def load_model_for_quantization(
             " are not represented.[/yellow]"
         )
 
+    if config.chat_template:
+        template_path = Path(config.chat_template)
+        if not template_path.is_file():
+            raise AftError(f"Chat template file not found: {template_path}")
+        tokenizer.chat_template = template_path.read_text()
+        console.print(f"[cyan]Chat template override: {template_path}[/cyan]")
+
     console.print("[cyan]Building calibration dataset...[/cyan]")
     calibration = get_calibration_data(
         tokenizer,

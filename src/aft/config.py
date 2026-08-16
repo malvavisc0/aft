@@ -42,6 +42,18 @@ class TrainConfig:
     #: Explicit LoRA target module names. When ``None`` the modules are
     #: discovered from the loaded model instead of being hard-coded.
     target_modules: list[str] | None = None
+    #: Dataset format: ``"text"`` (flattened strings, backwards-compatible) or
+    #: ``"messages"`` (structured chat rows with tool_calls/reasoning).
+    format: str = "text"
+    #: Label masking mode for the messages path: ``"full"`` (label every
+    #: assistant span) or ``"cumulative"`` (label only the final span).
+    mask_strategy: str = "full"
+    #: Local v22 chat template path (overrides the tokenizer's bundled one).
+    chat_template: str | None = None
+    #: Template kwargs, passed explicitly so rendering is deterministic.
+    enable_thinking: bool = True
+    reasoning_effort: str = "xhigh"
+    tool_call_format: str = "xml"
 
 
 @dataclass
@@ -64,6 +76,9 @@ class QuantizeConfig:
     revision: str | None = None
     #: Apply the model's chat template to calibration texts when available.
     use_chat_template: bool = True
+    #: Path to a local .jinja chat template that overrides the tokenizer's
+    #: bundled one, so calibration matches the serving template.
+    chat_template: str | None = None
     #: Fail if any quantizable layer is unexpectedly skipped by GPTQModel.
     strict_layer_coverage: bool = True
 

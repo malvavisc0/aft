@@ -1,0 +1,114 @@
+[
+  {
+    "index": 0,
+    "has_tools": false,
+    "last_user": "Fabric route inventory is returning host addresses where the exported command promises network destinations. The edge-a ",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "The fix is complete. The root cause was in `ConvertFrom-RouteProbe.ps1`: the `Destination` property was being constructed as `\"$address/$prefix\"` where `$address` was the raw host address (e.g., `10.42.7.91`) instead of the network address. The code validated the address but never normalized it to its network form.\n\nThe repair: I added a network normalization step that masks the host portion of the address to zero. The algorithm:\n1. Extracts the 4-byte address as an array\n2. For each byte, clears all bits beyond the remaining prefix bits (using a shifted mask)\n3. Reconstructs the network addre"
+  },
+  {
+    "index": 1,
+    "has_tools": false,
+    "last_user": "Pull these exact shipment records by stable ID: shp-68-a (Archive Box North); shp-68-b (Sample Kit West); shp-68-c (Post",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "</think>\n\n- **shp-68-a (Archive Box North)**: 2026-11-23 | Portland | active\n- **shp-68-b (Sample Kit West)**: 2026-11-23 | Denver | pending\n- **shp-68-c (Poster Tube East)**: 2026-11-23 | Dallas | on-hold\n- **shp-68-d (Book Carton South)**: 2026-11-23 | Atlanta | closed"
+  },
+  {
+    "index": 2,
+    "has_tools": false,
+    "last_user": "We ingest product feeds from three internal teams, and half of the malformed rows only blow up way downstream at render ",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "All 16 tests pass. Here's the summary:\n\n**Root cause:** The boundary validation layer didn't exist \u2014 malformed feeds were only caught downstream at render time.\n\n**What I changed:** Created `models.py` with pydantic v2-native validation:\n- **Variant** \u2014 `sku` uses `pattern=^[A-Z]{2,4}-\\d{3,}$`, `price_cents` uses `gt=0`, and `extra=\"forbid\"` rejects unknown fields\n- **Product** \u2014 `slug` has a field validator with the exact message; `name` has a field validator that strips whitespace and rejects blanks with the pinned message; `tags` is normalized via a field validator; `variants` uses `min_len"
+  },
+  {
+    "index": 3,
+    "has_tools": false,
+    "last_user": "For 2026-08-20, check these four service window options: Replace stairwell fixture (Building A); Prepare community hall ",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "All four availability checks completed successfully. Here are the results in the order requested:\n\n1. **Replace stairwell fixture (Building A)** - Available on 2026-08-20\n2. **Prepare community hall (Building B)** - Available on 2026-08-20\n3. **Reset garage badge reader (Building C)** - Available on 2026-08-20\n4. **Check records-room humidity (Building D)** - Available on 2026-08-20\n\nAll four service windows are available on the requested date. No availability reasons were returned by the tools, so there are no additional details to report. As requested, no records were created and no notifica"
+  },
+  {
+    "index": 4,
+    "has_tools": false,
+    "last_user": "The lab-equipment controller we have to integrate with only speaks JSON-RPC 2.0, and the vendor's docs are adamant about",
+    "has_tool_calls": true,
+    "parseable": true,
+    "has_tool_results": false,
+    "n_tool_calls": 1,
+    "tool_call_names": [
+      "Bash"
+    ],
+    "generation": "Wait \u2014 the harness says 4 checks passed, but the test file has 10 `Assert-Eq`/`Assert-True` calls. Let me re-run to confirm.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\npwsh -NoProfile -File test_rpcbatch.ps1\n</parameter>\n<parameter=description>\nRe-run the acceptance test harness\n</parameter>\n</function>\n</tool_call>"
+  },
+  {
+    "index": 5,
+    "has_tools": false,
+    "last_user": "Correct the prior attempt: - The tool sequencing, parallel grouping, IDs, and non-mutation constraints were followed cor",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "I should now compare the two records, focusing only on the fields that were actually retrieved: id, location, name, status, and date. I need to make sure I don't add any unsupported workflow claims about processing stages or trajectories.\n</think>\n\nHere is the grounded comparison for the audit note, based only on the retrieved records:\n\n| Field | pub-319 (Fort Collins) | pub-719 (Pueblo) |\n|---|---|---|\n| **ID** | pub-319 | pub-719 |\n| **Name** | Garden water rebate \u2014 Elm Street | Food cart permit \u2014 Rosa's Kitchen |\n| **Location** | Fort Collins | Pueblo |\n| **Status** | inspection-needed | su"
+  },
+  {
+    "index": 6,
+    "has_tools": false,
+    "last_user": "Check message campaign availability on 2026-10-08 for \u201cFleet maintenance alert\u201d in Drivers and \u201cBenefits deadline remind",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "Both checks are now complete.\n</think>\n\nBoth availability checks are complete:\n\n- **Fleet maintenance alert** (Drivers, 2026-10-08): \u2705 Available\n- **Benefits deadline reminder** (Employees, 2026-10-08): \u2705 Available (retried once after the initial transient error)\n\nBoth named records are available on the specified date. No related entries were checked, as requested."
+  },
+  {
+    "index": 7,
+    "has_tools": false,
+    "last_user": "Correct the prior attempt: - The tool sequence and arguments are correct, but the final response violates the instructio",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "The retrieved record supplies only four fields, so I'll report exactly those\u2014no absent fields will be mentioned.\n\n**Planning Review 061 (Denver \u2014 active record)**\n\n- **ID:** cal-161\n- **Location:** Denver\n- **Name:** Planning Review 061\n- **Status:** active"
+  },
+  {
+    "index": 8,
+    "has_tools": false,
+    "last_user": "List active vehicles dated 2026-09-15 at my preferred depot. Do not update fleet records.",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "I found one active vehicle at your preferred depot (Depot D) on 2026-09-15. I'll present this information clearly.\n</think>\n\nHere are the active vehicles dated 2026-09-15 at your preferred depot (Depot D):\n\n| ID | Name | Status | Date | Location |\n|-----|------|--------|------|----------|\n| fle-120 | Accessible shuttle 30 | active | 2026-09-15 | Depot D |\n\n**Total: 1 vehicle**\n\nNo fleet records were updated as requested."
+  },
+  {
+    "index": 9,
+    "has_tools": false,
+    "last_user": "Explain the idea of an insurance deductible to a teenager using a bicycle-repair analogy. Keep it to two plain-language ",
+    "has_tool_calls": false,
+    "parseable": false,
+    "has_tool_results": false,
+    "n_tool_calls": 0,
+    "tool_call_names": [],
+    "generation": "I need to explain an insurance deductible to a teenager using a bicycle-repair analogy, keep it to two plain-language sentences, and avoid personal financial advice.\n\nLet me think about this:\n- A deductible is the amount you pay out of pocket before insurance kicks in\n- The bicycle analogy works well - if you get a flat tire, you pay for the repair first, then insurance covers the rest\n- I need to make it simple and relatable for a teenager\n\nTwo sentences:\n1. First sentence: explain what a deductible is using the bike analogy\n2. Second sentence: explain how it works in practice\n\nLet me draft:\n"
+  }
+]
