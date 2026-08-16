@@ -151,8 +151,9 @@ vllm serve <artifact> \
 
 ## 8. Artifacts and where they live
 
-- Quantized model: HF hub, private (`Qwopus3.5-9B-v3.5-gptq-int4`),
-  pending the §6 serve probe.
+- Quantized model:
+  [`malvavisc0/Qwopus3.5-9B-v3.5-gptq-int4`](https://huggingface.co/malvavisc0/Qwopus3.5-9B-v3.5-gptq-int4)
+  (HF hub, private).
 - Smoke datasets: HF hub, private (400 train / 22 eval rows).
 - Experiment 0 eval generations: `experiments/qwen3.5/*.json` (base vs
   fine-tuned vs GPTQ artifact on the same 10 prompts).
