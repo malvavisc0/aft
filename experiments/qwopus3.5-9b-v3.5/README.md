@@ -1,4 +1,4 @@
-# Qwen3.5 Agent Pipeline — Experiment Record
+# Qwopus3.5-9B-v3.5 — GPTQ Int4 Experiment Record
 
 **Date:** 2026-08-13 → 2026-08-16
 **Status:** Complete. Qwopus3.5-9B-v3.5 GPTQ Int4 artifact built and

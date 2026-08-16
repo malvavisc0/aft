@@ -513,7 +513,7 @@ The `0.55` factor accounts for the NF4 quantization (4 bits/param) plus safetens
 - **No early stopping** — The pipeline trains for the specified number of epochs without monitoring validation loss.
 - **Gated datasets need manual setup** — presets like `starcoder` require accepting access terms on the dataset's HF page and setting `HF_TOKEN`. Non-gated presets (`fineweb-edu`, `nemotron-agentic`) work out of the box.
 - **fla and gptqmodel conflict in one process** — on hybrid-arch models (e.g. `qwen3_5` GatedDeltaNet), pre-importing `fla.ops` gives fused Triton kernels for training, but gptqmodel's Triton autotuner patch then crashes quantization. Train (fla imported) and quantize (no fla) as separate processes.
-- **Hybrid-arch LoRA discovery under-covers** — on `qwen3_5`-style models the default discovery misses the GatedDeltaNet `in_proj_qkv`/`in_proj_z` projections; pass `--target-modules` explicitly (see `EXPERIMENT.md`).
+- **Hybrid-arch LoRA discovery under-covers** — on `qwen3_5`-style models the default discovery misses the GatedDeltaNet `in_proj_qkv`/`in_proj_z` projections; pass `--target-modules` explicitly (see `experiments/qwopus3.5-9b-v3.5/README.md`).
 
 ## Development
 
